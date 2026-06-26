@@ -23,12 +23,12 @@ python delete.py
 
 ## 支持的浏览器
 
-| 浏览器 | 自动读取 | 备注 |
+| 浏览器 | 自动读取 | 说明 |
 |---|---|---|
-| **360 极速浏览器 X** | ✅ 自动 | 首次使用会自动检测 |
-| **Chrome** | ✅ 自动 | 通过 `browser-cookie3` |
-| **Edge** | ✅ 自动 | 通过 `browser-cookie3` |
-| **Firefox** | ✅ 自动 | 通过 `browser-cookie3` |
+| **360 极速浏览器 X** | ✅ 自动 | AES-GCM 解密 + 32 字节前缀剥离 |
+| **Chrome** | ✅ 自动 | 直接读取 SQLite，标准 AES-GCM 解密 |
+| **Edge** | ✅ 自动 | 同 Chrome，统一解密方式 |
+| **Firefox** | ✅ 自动 | 通过 `browser-cookie3` 读取 |
 
 ## 功能特性
 

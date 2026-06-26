@@ -354,26 +354,23 @@ class BilibiliLotteryCleaner:
         print(f"{'='*60}")
 
 
-def _try_360chrome_x() -> Optional[str]:
-    """尝试从360极速浏览器X读取cookie（32字节前缀的特殊加密）"""
+def _try_chromium_browser(
+    cookie_paths: List[str],
+    local_state_paths: List[str],
+    browser_name: str,
+    prefix_32: bool = False,
+) -> Optional[str]:
+    """通用的 Chromium 系浏览器 cookie 读取"""
     import shutil
     import sqlite3
     import json as pyjson
     import base64
+    import tempfile
+    import subprocess
     from win32crypt import CryptUnprotectData
     from Crypto.Cipher import AES
 
-    cookie_paths = [
-        r"C:\Users\Admin\AppData\Local\360ChromeX\Chrome\User Data\Default\Network\Cookies",
-        os.path.expanduser(r"~\AppData\Local\360ChromeX\Chrome\User Data\Default\Network\Cookies"),
-    ]
-    local_state_paths = [
-        r"C:\Users\Admin\AppData\Local\360ChromeX\Chrome\User Data\Local State",
-        os.path.expanduser(r"~\AppData\Local\360ChromeX\Chrome\User Data\Local State"),
-    ]
-
-    cookie_file = None
-    ls_file = None
+    cookie_file = ls_file = None
     for p in cookie_paths:
         if os.path.isfile(p):
             cookie_file = p
@@ -382,29 +379,70 @@ def _try_360chrome_x() -> Optional[str]:
         if os.path.isfile(p):
             ls_file = p
             break
-
     if not cookie_file or not ls_file:
-        return None  # 没找到360浏览器
+        return None
+
+    def _copy_db(src: str, dst: str) -> bool:
+        """尝试多种方式复制被锁的 Cookie DB"""
+        # 1. 直接复制
+        try:
+            shutil.copy2(src, dst)
+            return True
+        except PermissionError:
+            pass
+        # 2. PowerShell 绕锁（部分 Chromium 可用）
+        try:
+            r = subprocess.run(
+                ["powershell.exe", "-Command",
+                 f"Copy-Item -Force '{src}' '{dst}'; exit 0"],
+                capture_output=True, timeout=10
+            )
+            if os.path.isfile(dst) and os.path.getsize(dst) > 0:
+                return True
+        except Exception:
+            pass
+        # 3. 杀浏览器后台进程后重试（360 常驻后台较顽固）
+        try:
+            proc_name = os.path.basename(src).replace(".exe", "")
+            # 从路径推断进程名
+            if "360Chrome" in src:
+                subprocess.run(["taskkill", "/F", "/IM", "360ChromeX.exe"],
+                               capture_output=True, timeout=5)
+            elif "Chrome" in src:
+                subprocess.run(["taskkill", "/F", "/IM", "chrome.exe"],
+                               capture_output=True, timeout=5)
+            elif "Edge" in src:
+                subprocess.run(["taskkill", "/F", "/IM", "msedge.exe"],
+                               capture_output=True, timeout=5)
+            import time
+            time.sleep(1)
+            shutil.copy2(src, dst)
+            return True
+        except Exception:
+            pass
+        return False
 
     try:
-        # 复制Cookie DB（可能被锁）
-        import tempfile
+        # 复制 Cookie DB（多策略绕锁）
         tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".db")
         tmp.close()
-        shutil.copy2(cookie_file, tmp.name)
+        if not _copy_db(cookie_file, tmp.name):
+            raise PermissionError(f"无法读取 {browser_name} 的 cookie 文件")
 
-        # 获取master key
+        # 获取 master key
         with open(ls_file, "r", encoding="utf-8") as f:
             enc_key = base64.b64decode(pyjson.load(f)["os_crypt"]["encrypted_key"])[5:]
         master_key = CryptUnprotectData(enc_key, None, None, None, 0)[1]
 
-        # 解密360的cookie（AES-GCM，前32字节是360额外加的）
-        def decrypt_360(enc_val: bytes, key: bytes) -> str:
+        # 解密（不同浏览器可能前缀不同）
+        def decrypt_one(enc_val: bytes, key: bytes) -> str:
             nonce = enc_val[3:15]
             raw = AES.new(key, AES.MODE_GCM, nonce=nonce).decrypt_and_verify(
                 enc_val[15:-16], enc_val[-16:]
             )
-            return raw[32:].decode("utf-8")
+            # 360ChromeX 会在解密后的数据前加 32 字节的额外数据
+            data = raw[32:] if prefix_32 else raw
+            return data.decode("utf-8")
 
         cookies_dict = {}
         conn = sqlite3.connect(tmp.name)
@@ -418,7 +456,7 @@ def _try_360chrome_x() -> Optional[str]:
             n = name.decode("utf-8")
             if enc_val and enc_val[:3] == b"v10":
                 try:
-                    cookies_dict[n] = decrypt_360(enc_val, master_key)
+                    cookies_dict[n] = decrypt_one(enc_val, master_key)
                 except Exception:
                     pass
         conn.close()
@@ -426,7 +464,7 @@ def _try_360chrome_x() -> Optional[str]:
 
         if "DedeUserID" in cookies_dict and "bili_jct" in cookies_dict:
             cookie_str = "; ".join(f"{k}={v}" for k, v in cookies_dict.items())
-            print(f"✅ 已从 360极速浏览器X 读取到 {len(cookies_dict)} 个bilibili cookie")
+            print(f"✅ 已从 {browser_name} 读取到 {len(cookies_dict)} 个bilibili cookie")
             print(f"   DedeUserID: {cookies_dict.get('DedeUserID', '???')}")
             print(f"   cookie 仅内存暂存，不会写入任何文件")
             return cookie_str
@@ -435,71 +473,84 @@ def _try_360chrome_x() -> Optional[str]:
             os.unlink(tmp.name)
         except Exception:
             pass
-
     return None
 
 
 def get_bilibili_cookies() -> str:
     """从本地浏览器直接读取bilibili.com的cookie，不落盘"""
-    # 优先尝试360极速浏览器X（用户当前在用）
-    if platform.system() == "Windows":
-        result = _try_360chrome_x()
+    # 各 Chromium 浏览器的 cookie 路径定义
+    CHROMIUM_BROWSERS = [
+        {
+            "name": "360极速浏览器X",
+            "cookie_paths": [
+                r"C:\Users\Admin\AppData\Local\360ChromeX\Chrome\User Data\Default\Network\Cookies",
+                os.path.expanduser(r"~\AppData\Local\360ChromeX\Chrome\User Data\Default\Network\Cookies"),
+            ],
+            "ls_paths": [
+                r"C:\Users\Admin\AppData\Local\360ChromeX\Chrome\User Data\Local State",
+                os.path.expanduser(r"~\AppData\Local\360ChromeX\Chrome\User Data\Local State"),
+            ],
+            "prefix_32": True,  # 360ChromeX 特有的 32 字节前缀
+        },
+        {
+            "name": "Chrome",
+            "cookie_paths": [
+                r"C:\Users\Admin\AppData\Local\Google\Chrome\User Data\Default\Network\Cookies",
+                os.path.expanduser(r"~\AppData\Local\Google\Chrome\User Data\Default\Network\Cookies"),
+            ],
+            "ls_paths": [
+                r"C:\Users\Admin\AppData\Local\Google\Chrome\User Data\Local State",
+                os.path.expanduser(r"~\AppData\Local\Google\Chrome\User Data\Local State"),
+            ],
+            "prefix_32": False,
+        },
+        {
+            "name": "Edge",
+            "cookie_paths": [
+                r"C:\Users\Admin\AppData\Local\Microsoft\Edge\User Data\Default\Network\Cookies",
+                os.path.expanduser(r"~\AppData\Local\Microsoft\Edge\User Data\Default\Network\Cookies"),
+            ],
+            "ls_paths": [
+                r"C:\Users\Admin\AppData\Local\Microsoft\Edge\User Data\Local State",
+                os.path.expanduser(r"~\AppData\Local\Microsoft\Edge\User Data\Local State"),
+            ],
+            "prefix_32": False,
+        },
+    ]
+
+    # 优先尝试 Chromium 系浏览器（直接 SQLite + AES-GCM 解密）
+    for cfg in CHROMIUM_BROWSERS:
+        result = _try_chromium_browser(
+            cfg["cookie_paths"], cfg["ls_paths"],
+            cfg["name"], prefix_32=cfg["prefix_32"],
+        )
         if result:
             return result
 
+    # 最后尝试 Firefox（browser-cookie3）
     try:
         import browser_cookie3
     except ImportError:
-        print("❌ 需要安装 browser-cookie3: pip install browser-cookie3")
-        print("   也可以手动粘贴cookie，运行: python delete.py --cookie '你的cookie'")
+        print("❌ 需要安装 browser-cookie3 才能读取 Firefox: pip install browser-cookie3")
         sys.exit(1)
 
-    browsers = []
-    system = platform.system()
-
-    if system == "Windows":
-        browsers = [
-            ("Chrome", browser_cookie3.chrome),
-            ("Edge", browser_cookie3.edge),
-            ("Firefox", browser_cookie3.firefox),
-        ]
-    elif system == "Darwin":
-        browsers = [
-            ("Chrome", browser_cookie3.chrome),
-            ("Firefox", browser_cookie3.firefox),
-            ("Safari", browser_cookie3.safari),
-        ]
-    else:
-        browsers = [
-            ("Chrome", browser_cookie3.chrome),
-            ("Firefox", browser_cookie3.firefox),
-        ]
-
-    for name, loader in browsers:
-        try:
-            cj = loader(domain_name="bilibili.com")
-            if cj is None or len(list(cj)) == 0:
-                continue
-
+    try:
+        cj = browser_cookie3.firefox(domain_name="bilibili.com")
+        if cj:
             cookies_dict = {}
             for cookie in cj:
                 if "bilibili" in cookie.domain:
                     cookies_dict[cookie.name] = cookie.value
-
-            if "DedeUserID" not in cookies_dict or "bili_jct" not in cookies_dict:
-                continue
-
-            cookie_str = "; ".join(f"{k}={v}" for k, v in cookies_dict.items())
-            print(f"✅ 已从 {name} 浏览器读取到 {len(cookies_dict)} 个bilibili cookie")
-            print(f"   DedeUserID: {cookies_dict.get('DedeUserID', '???')}")
-            print(f"   cookie 仅内存暂存，不会写入任何文件")
-            return cookie_str
-
-        except Exception:
-            continue
+            if "DedeUserID" in cookies_dict and "bili_jct" in cookies_dict:
+                cookie_str = "; ".join(f"{k}={v}" for k, v in cookies_dict.items())
+                print(f"✅ 已从 Firefox 读取到 {len(cookies_dict)} 个bilibili cookie")
+                print(f"   DedeUserID: {cookies_dict.get('DedeUserID', '???')}")
+                return cookie_str
+    except Exception:
+        pass
 
     print("❌ 未在本地浏览器中找到bilibili登录cookie")
-    print("   请确保已在Chrome/Edge/Firefox/360极速浏览器X中登录bilibili.com")
+    print("   请确保已在 Chrome/Edge/Firefox/360极速浏览器X 中登录 bilibili.com")
     sys.exit(1)
 
 

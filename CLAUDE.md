@@ -8,8 +8,8 @@
 
 - **Python 3** — 单文件脚本（≈550 行）
 - **requests** — HTTP 请求
-- **browser-cookie3** — 从 Chrome/Edge/Firefox 读取 cookie（不落盘）
-- **pycryptodomex + pywin32** — 解密 360 极速浏览器 X 的加密 cookie
+- **pycryptodomex + pywin32** — AES-GCM 解密所有 Chromium 系浏览器 cookie
+- **browser-cookie3** — 备用读取 Firefox cookie
 
 ## 项目结构
 
@@ -46,16 +46,20 @@ python delete.py
 
 | 函数 | 作用 |
 |---|---|
-| `get_bilibili_cookies()` | 入口：优先 360 → Chrome/Edge/Firefox 自动读取 cookie |
-| `_try_360chrome_x()` | 读取 360 极速浏览器 X 的加密 cookie（32 字节前缀特殊处理） |
+| `get_bilibili_cookies()` | 入口：自动探测各浏览器并读取 cookie |
+| `_try_chromium_browser()` | 通用 Chromium 浏览器读取（SQLite + AES-GCM 解密），支持 Chrome/Edge/360 ChromeX |
 | `main()` | 交互式运行入口 |
 
 ### cookie 读取策略
 
-1. **360 极速浏览器 X**（首选）— 直接读取 SQLite 数据库，AES-GCM 解密（360 额外加了 32 字节前缀需剥离），通过 PowerShell 绕过文件锁
-2. **Chrome** — `browser-cookie3.chrome()`
-3. **Edge** — `browser-cookie3.edge()`
-4. **Firefox** — `browser-cookie3.firefox()`
+依次尝试各浏览器，找到有效登录即用：
+
+1. **360 极速浏览器 X** — AES-GCM 解密，需剥离 32 字节额外前缀
+2. **Chrome** — AES-GCM 解密（标准格式）
+3. **Edge** — AES-GCM 解密（标准格式）
+4. **Firefox** — 通过 `browser-cookie3` 读取
+
+锁定绕过：直接复制 → PowerShell 绕锁 → taskkill 杀后台进程后重试
 
 ### 检测策略（`is_lottery_dynamic`）
 
