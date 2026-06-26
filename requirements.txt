@@ -1,0 +1,4 @@
+requests
+pycryptodome
+pywin32; platform_system == "Windows"
+browser-cookie3; platform_system == "Windows"

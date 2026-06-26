@@ -6,29 +6,29 @@
 
 ## 技术栈
 
-- **Python 3** — 单文件脚本（≈550 行）
+- **Python 3** — 单文件脚本（≈600 行）
 - **requests** — HTTP 请求
-- **pycryptodomex + pywin32** — AES-GCM 解密所有 Chromium 系浏览器 cookie
+- **pycryptodome + pywin32** — AES-GCM 解密 Chromium 系浏览器 cookie
 - **browser-cookie3** — 备用读取 Firefox cookie
 
 ## 项目结构
 
 ```
 bili_delete/
-├── delete.py       # 主脚本
-├── README.md       # 用户文档
-├── CLAUDE.md       # 本文件（技术文档）
-└── .gitignore      # 排除所有敏感文件
+├── delete.py            # 主脚本
+├── README.md            # 用户文档
+├── CLAUDE.md            # 本文件（技术文档）
+├── requirements.txt     # Python 依赖
+└── .gitignore           # 排除所有敏感文件
 ```
 
 ## 运行方式
 
 ```bash
-pip install requests browser-cookie3 pycryptodomex pywin32
-python delete.py
+pip install -r requirements.txt
+python delete.py            # 试运行
+python delete.py --execute  # 正式删除
 ```
-
-程序自动从浏览器读取 cookie，交互式询问调试模式和运行模式（试运行/正式删除）。
 
 ## 架构说明
 
@@ -36,52 +36,40 @@ python delete.py
 
 | 方法 | 作用 |
 |---|---|
-| `get_dynamics()` | 分页拉取用户全部动态（调用 B 站 API） |
-| `is_lottery_dynamic()` | 检测动态是否为抽奖（4 层策略） |
-| `check_lottery_status()` | 检查抽奖是否已开奖 |
-| `delete_dynamic()` | 删除单条动态（JSON 格式 POST） |
-| `process_dynamics()` | 主循环：遍历 → 检测 → 开奖检查 → 删除 |
-
-### 关键函数
-
-| 函数 | 作用 |
-|---|---|
-| `get_bilibili_cookies()` | 入口：自动探测各浏览器并读取 cookie |
-| `_try_chromium_browser()` | 通用 Chromium 浏览器读取（SQLite + AES-GCM 解密），支持 Chrome/Edge/360 ChromeX |
-| `main()` | 交互式运行入口 |
+| `get_dynamics()` | 分页拉取用户全部动态 |
+| `is_lottery_dynamic()` | 本地检测抽奖（关键词 + 字段 + 正则，不做 API） |
+| `get_lottery_info()` | 查询抽奖状态，带缓存避免重复请求 |
+| `check_lottery_status()` | 判断是否已开奖（优先状态字段，无则时间 + 2h 安全缓冲） |
+| `delete_dynamic()` | 删除单条（仅当 `item.params` 含 `dyn_id_str` 时才删） |
+| `process_dynamics()` | 主循环，支持二次确认 |
+| `_confirm_and_delete()` | 打印候选列表，输入 `DELETE` 才执行 |
 
 ### cookie 读取策略
 
-依次尝试各浏览器，找到有效登录即用：
+`get_bilibili_cookies()` 依次尝试：
 
-1. **360 极速浏览器 X** — AES-GCM 解密，需剥离 32 字节额外前缀
-2. **Chrome** — AES-GCM 解密（标准格式）
-3. **Edge** — AES-GCM 解密（标准格式）
-4. **Firefox** — 通过 `browser-cookie3` 读取
+1. **360 极速浏览器 X** — AES-GCM + 32 字节前缀剥离
+2. **Chrome** — 标准 AES-GCM 解密
+3. **Edge** — 标准 AES-GCM 解密
+4. **Firefox** — 通过 `browser-cookie3`
 
-锁定绕过：直接复制 → PowerShell 绕锁 → taskkill 杀后台进程后重试
+`_copy_db()` 三步绕锁：直接复制 → PowerShell → 用户手动关浏览器（`--kill-browser` 才杀进程）
 
-### 检测策略（`is_lottery_dynamic`）
+### 检测策略
 
-1. **深度递归搜索** — 递归扫描 API 返回的 JSON 中是否有 `lottery`/`抽奖` 等关键词
-2. **模块字段检测** — `additional.type` 字段匹配 `lottery` 特征
-3. **正则匹配** — 动态文案匹配 `抽奖`、`关注+转发`、`转关` 等模式
-4. **API 验证** — 调用 B 站抽奖状态接口确认
+四层检测（本地，不调 API）：
+1. **递归搜 JSON** — 匹配 `lottery`/`抽奖` 等关键词
+2. **字段匹配** — `additional.type` 含 `lottery`
+3. **正则** — 文案匹配 `抽奖`、`关注+转发`、`转关`
+4. **API 验证** — 延迟到 `check_lottery_status` 中统一查询（带缓存）
 
-### 删除逻辑（`delete_dynamic`）
+### 安全设计
 
-POST 方式发送 JSON 请求，需要三个参数：
-- `dyn_id_str` — 动态 ID
-- `rid_str` — 原动态 ID（转发用原动态）
-- `dyn_type` — 动态类型
-
-使用 `json=` 而非 `data=` 发送请求体。
-
-### 数据安全
-
-- cookie **不落盘**：浏览器 → 内存 → 用完即弃
-- `.gitignore` 排除了 `cookie.txt`、`debug_*.json`
-- 项目仓库不含任何用户凭证
+- Cookie 仅内存暂存，不自持永久文件
+- 删除必需 `item.params.dyn_id_str`，缺少时跳过（宁可漏删）
+- 开奖时间 +2h 安全缓冲，防止延迟开奖误删
+- 二次确认：列出全部候选，键入 `DELETE` 才执行
+- `--kill-browser` 默认关闭
 
 ## B 站 API 要点
 
@@ -91,14 +79,7 @@ POST 方式发送 JSON 请求，需要三个参数：
 | `vc.bilibili.com/lottery_svr/.../lottery_notice` | 查询抽奖状态 |
 | `x/dynamic/feed/operate/remove` | 删除动态（POST JSON） |
 
-## 已知问题
+## 维护
 
-- 360 极速浏览器 X 有**常驻后台进程**，拷贝 cookie DB 时可能需 PowerShell 绕锁
-- B 站 API 可能对高频率请求限流，脚本内置 2-4 秒随机延迟
-- 非互动抽奖（如转发抽奖）可能无法完全识别
-- 如所有浏览器 cookie 均过期，需重新登录
-
-## 维护者
-
-- Git 远端: https://gitee.com/adam121389/bili_delete.git
-- 分支策略: 单分支 `main`，直接推送
+- 仓库: https://gitee.com/adam121389/bili_delete.git
+- 分支: `main`

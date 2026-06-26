@@ -1,9 +1,23 @@
-# 敏感账号数据,禁止提交
-cookie.txt
-debug_dynamic.json
-debug_item.json
+# 敏感信息 — 禁止提交
+cookie*.txt
+cookies*.txt
+*.cookie
+*.db
+*.sqlite
+*.sqlite3
+debug_*.json
+*.har
+.env
+.env.*
 
 # Python
 __pycache__/
 *.py[cod]
+*.pyo
+.venv/
+venv/
 *.log
+
+# OS
+Thumbs.db
+.DS_Store
