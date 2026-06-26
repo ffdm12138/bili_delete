@@ -1,0 +1,9 @@
+# 敏感账号数据,禁止提交
+cookie.txt
+debug_dynamic.json
+debug_item.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.log
