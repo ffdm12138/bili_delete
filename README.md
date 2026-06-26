@@ -69,8 +69,11 @@ python delete.py --non-interactive
 # 导出候选列表
 python delete.py --export-candidates
 
-# 同时清理失效转发动态
+# 扫描抽奖候选 + 失效转发候选（不删除）
 python delete.py --include-invalid-repost
+
+# 确认后删除抽奖候选 + 失效转发候选
+python delete.py --execute --include-invalid-repost
 ```
 
 ## 功能特性
@@ -97,6 +100,9 @@ python delete.py --include-invalid-repost
 ```
 bili_delete/
 ├── delete.py            # 主脚本
+├── tests/
+│   └── test_delete.py   # 132 个测试用例
+├── pack.py              # 打包工具
 ├── README.md            # 本文件
 ├── CLAUDE.md            # 技术文档
 ├── requirements.txt     # Python 依赖

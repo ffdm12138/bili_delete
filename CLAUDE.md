@@ -79,7 +79,7 @@ BiliError (base)
 | 方法 | 作用 |
 |---|---|
 | `get_dynamics()` | 分页拉取用户动态，失败抛 `BiliError`（不再静默返回空列表） |
-| `get_lottery_info()` | 查询抽奖状态，带缓存，网络错误缓存 None 避免重复请求 |
+| `get_lottery_info()` | 查询抽奖状态，带缓存，失败缓存 LotteryQueryResult（含 error_type/code），UNKNOWN 不删 |
 | `check_lottery_status()` | 返回 `(LotteryState, lottery_time, reason_detail)` |
 | `delete_dynamic()` | 删除单条，返回 `(bool, error_msg)`（仅当 `item.params` 完整时执行） |
 | `process_dynamics()` | 主循环，支持 dry-run / execute / require_confirm 三种路径 |
@@ -160,7 +160,7 @@ SQL 查询: `host_key LIKE '%bilibili.com'`（覆盖所有子域名，不限于 
 ## 测试
 
 ```bash
-pytest tests/ -v        # 131 个测试，~0.3s 完成（已消除真实 sleep）
+pytest tests/ -v        # 132 个测试，~0.3s 完成（已消除真实 sleep）
 ```
 
 测试覆盖：

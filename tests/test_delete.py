@@ -1664,9 +1664,9 @@ class TestCookieSuccessPath:
         fake_win32crypt = Mock()
         fake_cryptodome = Mock()
         fake_cryptodome.Cipher = Mock()
-        sys.modules["win32crypt"] = fake_win32crypt
-        sys.modules["Cryptodome"] = fake_cryptodome
-        sys.modules["Cryptodome.Cipher"] = fake_cryptodome.Cipher
+        monkeypatch.setitem(sys.modules, "win32crypt", fake_win32crypt)
+        monkeypatch.setitem(sys.modules, "Cryptodome", fake_cryptodome)
+        monkeypatch.setitem(sys.modules, "Cryptodome.Cipher", fake_cryptodome.Cipher)
 
         fake_key = b"\x00" * 32
         fake_win32crypt.CryptUnprotectData.return_value = (None, fake_key)
@@ -1693,7 +1693,7 @@ class TestCookieSuccessPath:
         assert "DedeUserID=" in result
         assert "bili_jct=" in result
 
-    def test_decrypt_chromium_cookies_missing_cookies(self, tmp_path):
+    def test_decrypt_chromium_cookies_missing_cookies(self, tmp_path, monkeypatch):
         """No bilibili rows → should return None, not error."""
         import sqlite3
         import json as _json
@@ -1701,9 +1701,9 @@ class TestCookieSuccessPath:
         fake_win32crypt = Mock()
         fake_cryptodome = Mock()
         fake_cryptodome.Cipher = Mock()
-        sys.modules["win32crypt"] = fake_win32crypt
-        sys.modules["Cryptodome"] = fake_cryptodome
-        sys.modules["Cryptodome.Cipher"] = fake_cryptodome.Cipher
+        monkeypatch.setitem(sys.modules, "win32crypt", fake_win32crypt)
+        monkeypatch.setitem(sys.modules, "Cryptodome", fake_cryptodome)
+        monkeypatch.setitem(sys.modules, "Cryptodome.Cipher", fake_cryptodome.Cipher)
         fake_win32crypt.CryptUnprotectData.return_value = (None, b"\x00" * 32)
 
         db_path = str(tmp_path / "Cookies")
@@ -1721,14 +1721,20 @@ class TestCookieSuccessPath:
 
         assert result is None
 
-    def test_try_chromium_browser_success_path(self, tmp_path):
+    def test_try_chromium_browser_success_path(self, tmp_path, monkeypatch):
         """Regression: _try_chromium_browser must return cookie_str, not None.
-        This prevents the 'finally return None overwrites success' bug."""
+        This prevents the 'finally return None overwrites success' bug.
+        Must pass when run individually, not just after other cookie tests."""
         import shutil
-        import tempfile
         from delete import _try_chromium_browser
 
-        # Create fake cookie DB and local state files
+        # Inject fake Windows crypto modules (self-contained, no test-order dep)
+        fake_win32crypt = Mock()
+        fake_cryptodome = Mock()
+        monkeypatch.setitem(sys.modules, "win32crypt", fake_win32crypt)
+        monkeypatch.setitem(sys.modules, "Cryptodome", fake_cryptodome)
+        monkeypatch.setitem(sys.modules, "Cryptodome.Cipher", Mock())
+
         cookie_db = tmp_path / "Cookies"
         local_state = tmp_path / "Local State"
         cookie_db.write_bytes(b"fake sqlite db")

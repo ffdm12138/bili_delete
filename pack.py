@@ -114,7 +114,7 @@ def pack_snapshot(files: list[str]) -> Path:
         diff or "(no parent commit / not a git repo)",
         "````",
         "",
-        "## Tracked files",
+        "## Project files",
         "````text",
         *files,
         "````",
