@@ -7,6 +7,7 @@ Run:  pytest tests/ -v
 import argparse
 import json
 import sys
+import time
 from datetime import datetime, timedelta, timezone
 from unittest.mock import Mock, patch, MagicMock
 from pathlib import Path
@@ -227,6 +228,38 @@ class TestParseLotteryState:
     def test_no_status_no_time(self):
         state, _ = parse_lottery_state({"other_field": "value"})
         assert state == LotteryState.UNKNOWN
+
+    def test_lottery_status_zero_is_active(self):
+        """lottery_status=0 must be ACTIVE, not eaten by `or`."""
+        old_ts = (datetime.now(TZ_SHANGHAI) - timedelta(days=365)).timestamp()
+        state, reason = parse_lottery_state({
+            "lottery_status": 0,
+            "lottery_time": old_ts,
+        })
+        assert state == LotteryState.ACTIVE, (
+            "lottery_status=0 must be ACTIVE, not bypassed to time fallback"
+        )
+        assert reason == "api_status"
+
+    def test_lottery_status_false_is_active(self):
+        """lottery_status=False must be ACTIVE."""
+        old_ts = (datetime.now(TZ_SHANGHAI) - timedelta(days=365)).timestamp()
+        state, reason = parse_lottery_state({
+            "lottery_status": False,
+            "lottery_time": old_ts,
+        })
+        assert state == LotteryState.ACTIVE
+        assert reason == "api_status"
+
+    def test_status_zero_is_active(self):
+        """status=0 must be ACTIVE (when lottery_status key absent)."""
+        old_ts = (datetime.now(TZ_SHANGHAI) - timedelta(days=365)).timestamp()
+        state, reason = parse_lottery_state({
+            "status": 0,
+            "lottery_time": old_ts,
+        })
+        assert state == LotteryState.ACTIVE
+        assert reason == "api_status"
 
     def test_lottery_state_can_delete(self):
         assert LotteryState.FINISHED.can_delete() is True
@@ -974,6 +1007,69 @@ class TestProcessDynamics:
                             "All candidates must carry raw_item for deletion"
                         )
                         assert "params" in c.raw_item
+
+    def test_failed_delete_increments_failed_not_deleted(self, sample_lottery_item):
+        """P0-2 regression: (False, 'error') tuple must NOT be truthy."""
+        from delete import BilibiliLotteryCleaner
+
+        cleaner = BilibiliLotteryCleaner(
+            "DedeUserID=1; bili_jct=abc; SESSDATA=x"
+        )
+
+        with patch.object(cleaner, "get_dynamics") as mock_get:
+            mock_get.return_value = ([sample_lottery_item], None)
+
+            with patch.object(cleaner, "get_lottery_info") as mock_lottery:
+                mock_lottery.return_value = LotteryQueryResult(info={
+                    "lottery_status": "1",
+                    "lottery_time": (
+                        datetime.now(TZ_SHANGHAI) - timedelta(days=7)
+                    ).timestamp(),
+                })
+
+                with patch.object(cleaner, "delete_dynamic") as mock_delete:
+                    # Return (False, "error") — must NOT be treated as success
+                    mock_delete.return_value = (False, "api error")
+
+                    with patch.object(time, "sleep", lambda _: None):
+                        with patch.object(cleaner, "_random_delay", lambda *a, **kw: None):
+                            cleaner.process_dynamics(
+                                dry_run=False, require_confirm=False,
+                            )
+
+                assert cleaner.stats["deleted"] == 0, (
+                    "BUG: (False, 'error') treated as True due to tuple truthiness"
+                )
+                assert cleaner.stats["failed"] >= 1
+
+    def test_lottery_status_zero_never_finished(self, sample_lottery_item):
+        """P0-3 regression: lottery_status=0 → ACTIVE even with old timestamp."""
+        from delete import BilibiliLotteryCleaner
+
+        # Modify sample item to trigger lottery detection
+        cleaner = BilibiliLotteryCleaner(
+            "DedeUserID=1; bili_jct=abc; SESSDATA=x"
+        )
+
+        with patch.object(cleaner, "get_dynamics") as mock_get:
+            mock_get.return_value = ([sample_lottery_item], None)
+
+            with patch.object(cleaner, "get_lottery_info") as mock_lottery:
+                # lottery_status=0, very old lottery_time — must stay ACTIVE
+                mock_lottery.return_value = LotteryQueryResult(info={
+                    "lottery_status": 0,
+                    "lottery_time": (
+                        datetime.now(TZ_SHANGHAI) - timedelta(days=365)
+                    ).timestamp(),
+                })
+
+                with patch.object(cleaner, "delete_dynamic") as mock_delete:
+                    cleaner.process_dynamics(
+                        dry_run=False, require_confirm=False,
+                    )
+
+                # Must NOT delete — status 0 means active
+                mock_delete.assert_not_called()
 
 
 # ===================================================================

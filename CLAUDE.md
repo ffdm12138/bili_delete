@@ -112,13 +112,16 @@ SQL 查询: `host_key LIKE '%bilibili.com'`（覆盖所有子域名，不限于 
 ### 开奖状态判断优先级
 
 `parse_lottery_state()`:
-1. `lottery_status` / `status` 显式字段：
+1. 显式字段（key 存在判断，非 `or`，避免 0/False 被吃掉）：
+   - `"lottery_status"` 优先于 `"status"`
    - `1` / `true` / `finished` / `closed` / `drawn` → `FINISHED`
    - `0` / `false` / `active` / `open` / `ongoing` → `ACTIVE`
-   - 无法识别 → 进入时间 fallback
-2. `lottery_time` + 2h 安全缓冲 < 当前时间 → `FINISHED`（标记 `time_fallback`）
-3. `lottery_time` 存在但未过期 → `ACTIVE`
-4. 没有任何信息 → `UNKNOWN`（**绝对不删**）
+   - **无法识别的显式值 → `UNKNOWN`，不走时间 fallback**
+     （新/未知状态可能代表"已取消""异常"等，时间推断不安全）
+2. 仅当**完全没有显式 status 字段**时，才允许时间 fallback：
+   - `lottery_time` + 2h 安全缓冲 < 当前时间 → `FINISHED`（标记 `time_fallback`）
+   - `lottery_time` 存在但未过期 → `ACTIVE`
+3. 没有任何信息 → `UNKNOWN`（**绝对不删**）
 
 所有 datetime 为 timezone-aware（`Asia/Shanghai`, UTC+8）。
 

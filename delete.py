@@ -278,19 +278,25 @@ def parse_lottery_state(info: Optional[dict]) -> Tuple[LotteryState, str]:
     if not isinstance(info, dict) or not info:
         return LotteryState.UNKNOWN, "empty_info"
 
-    # --- Explicit status field ---
+    # --- Explicit status field (key-exists check, not `or`) ---
+    # `or` would eat falsy values like 0 / False — use explicit key check.
     has_explicit_status = False
-    status_raw = info.get("lottery_status") or info.get("status")
-    if status_raw is not None:
+    if "lottery_status" in info:
+        status_raw = info["lottery_status"]
         has_explicit_status = True
+    elif "status" in info:
+        status_raw = info["status"]
+        has_explicit_status = True
+    else:
+        status_raw = None
+
+    if has_explicit_status:
         s = str(status_raw).strip().lower()
         if s in ("1", "true", "finished", "closed", "drawn"):
             return LotteryState.FINISHED, "api_status"
         if s in ("0", "false", "active", "open", "ongoing"):
             return LotteryState.ACTIVE, "api_status"
         # Unrecognised explicit status — UNKNOWN, do NOT fall through to time.
-        # Reason: new/unknown status values may mean "cancelled", "error",
-        # "restricted", etc.  Time-based deletion is unsafe here.
         return LotteryState.UNKNOWN, f"unknown_status:{s}"
 
     # --- Time-based fallback (only when NO explicit status exists) ---
@@ -633,7 +639,15 @@ class BilibiliLotteryCleaner:
 
         try:
             resp = retry_request(_do, label=label)
-        except (NetworkError, RateLimitError) as e:
+        except RateLimitError as e:
+            result = LotteryQueryResult(
+                error_type="rate_limit",
+                message=str(e),
+            )
+            self._lottery_cache[orig_id] = result
+            print(f"   ⚠️  查询抽奖状态被限流，跳过: {orig_id[:18]}")
+            return result
+        except NetworkError as e:
             result = LotteryQueryResult(
                 error_type="network",
                 message=str(e),
@@ -1058,9 +1072,14 @@ class BilibiliLotteryCleaner:
                 print(f"   ⚠️  缺少原始动态数据，跳过: {c.dyn_id[:18]}")
                 self.stats["failed"] += 1
                 continue
-            if self.delete_dynamic(c.raw_item):
-                self.stats["deleted"] += 1
-            else:
+            try:
+                ok, err = self.delete_dynamic(c.raw_item)
+                if ok:
+                    self.stats["deleted"] += 1
+                else:
+                    self.stats["failed"] += 1
+            except Exception as e:
+                print(f"   ❌ 删除异常: {e}")
                 self.stats["failed"] += 1
             self._random_delay(2.0, 4.0)
 
@@ -1071,9 +1090,14 @@ class BilibiliLotteryCleaner:
                 print(f"   ⚠️  缺少原始动态数据，跳过: {c.dyn_id[:18]}")
                 self.stats["failed"] += 1
                 continue
-            if self.delete_dynamic(c.raw_item):
-                self.stats["deleted"] += 1
-            else:
+            try:
+                ok, err = self.delete_dynamic(c.raw_item)
+                if ok:
+                    self.stats["deleted"] += 1
+                else:
+                    self.stats["failed"] += 1
+            except Exception as e:
+                print(f"   ❌ 删除异常: {e}")
                 self.stats["failed"] += 1
             self._random_delay(2.0, 4.0)
 
