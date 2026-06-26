@@ -240,15 +240,16 @@ class BilibiliLotteryCleaner:
         url = "https://api.bilibili.com/x/dynamic/feed/operate/remove"
 
         item_params = item.get("params", {})
-        if not item_params or "dyn_id_str" not in item_params:
+        required = ["dyn_id_str", "rid_str", "dyn_type"]
+        if not all(k in item_params for k in required):
             dyn_id = item.get("id_str", "?")
             dyn_id_short = str(dyn_id)[:18]
-            print(f"   ⚠️  缺少 B 站返回的删除参数（dyn_id_str），安全起见跳过: {dyn_id_short}")
+            print(f"   ⚠️  缺少 B 站返回的完整删除参数，安全跳过: {dyn_id_short}")
             return False
 
         dyn_id_str = str(item_params["dyn_id_str"])
-        rid_str = str(item_params.get("rid_str", dyn_id_str))
-        dyn_type = int(item_params.get("dyn_type", 1))
+        rid_str = str(item_params["rid_str"])
+        dyn_type = int(item_params["dyn_type"])
 
         url_params = {"platform": "web", "csrf": self.csrf}
         json_payload = {
@@ -416,7 +417,7 @@ def _try_chromium_browser(
     import json as pyjson
     import base64
     from win32crypt import CryptUnprotectData
-    from Crypto.Cipher import AES
+    from Cryptodome.Cipher import AES
 
     cookie_file = ls_file = None
     for p in cookie_paths:
@@ -451,6 +452,11 @@ def _try_chromium_browser(
             pass
         # 3. 除非用户显式允许，否则不杀进程
         if not allow_kill_browser:
+            return False
+        # 即使 --kill-browser，仍需交互确认
+        confirm = input("⚠️  浏览器 Cookie 数据库被占用。输入 YES 允许强制关闭浏览器: ").strip()
+        if confirm != "YES":
+            print("⏹  取消操作")
             return False
         proc_map = {
             "360Chrome": "360ChromeX.exe",
@@ -533,11 +539,11 @@ def get_bilibili_cookies(allow_kill_browser: bool = False) -> str:
         {
             "name": "360极速浏览器X",
             "cookie_paths": [
-                r"C:\Users\Admin\AppData\Local\360ChromeX\Chrome\User Data\Default\Network\Cookies",
                 os.path.expanduser(r"~\AppData\Local\360ChromeX\Chrome\User Data\Default\Network\Cookies"),
+                os.path.expanduser(r"~\AppData\Local\360ChromeX\Chrome\User Data\Profile 1\Network\Cookies"),
+                os.path.expanduser(r"~\AppData\Local\360ChromeX\Chrome\User Data\Profile 2\Network\Cookies"),
             ],
             "ls_paths": [
-                r"C:\Users\Admin\AppData\Local\360ChromeX\Chrome\User Data\Local State",
                 os.path.expanduser(r"~\AppData\Local\360ChromeX\Chrome\User Data\Local State"),
             ],
             "prefix_32": True,
@@ -545,11 +551,11 @@ def get_bilibili_cookies(allow_kill_browser: bool = False) -> str:
         {
             "name": "Chrome",
             "cookie_paths": [
-                r"C:\Users\Admin\AppData\Local\Google\Chrome\User Data\Default\Network\Cookies",
                 os.path.expanduser(r"~\AppData\Local\Google\Chrome\User Data\Default\Network\Cookies"),
+                os.path.expanduser(r"~\AppData\Local\Google\Chrome\User Data\Profile 1\Network\Cookies"),
+                os.path.expanduser(r"~\AppData\Local\Google\Chrome\User Data\Profile 2\Network\Cookies"),
             ],
             "ls_paths": [
-                r"C:\Users\Admin\AppData\Local\Google\Chrome\User Data\Local State",
                 os.path.expanduser(r"~\AppData\Local\Google\Chrome\User Data\Local State"),
             ],
             "prefix_32": False,
@@ -557,11 +563,11 @@ def get_bilibili_cookies(allow_kill_browser: bool = False) -> str:
         {
             "name": "Edge",
             "cookie_paths": [
-                r"C:\Users\Admin\AppData\Local\Microsoft\Edge\User Data\Default\Network\Cookies",
                 os.path.expanduser(r"~\AppData\Local\Microsoft\Edge\User Data\Default\Network\Cookies"),
+                os.path.expanduser(r"~\AppData\Local\Microsoft\Edge\User Data\Profile 1\Network\Cookies"),
+                os.path.expanduser(r"~\AppData\Local\Microsoft\Edge\User Data\Profile 2\Network\Cookies"),
             ],
             "ls_paths": [
-                r"C:\Users\Admin\AppData\Local\Microsoft\Edge\User Data\Local State",
                 os.path.expanduser(r"~\AppData\Local\Microsoft\Edge\User Data\Local State"),
             ],
             "prefix_32": False,

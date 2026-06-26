@@ -1,4 +1,4 @@
 requests
-pycryptodome
+browser-cookie3
+pycryptodomex
 pywin32; platform_system == "Windows"
-browser-cookie3; platform_system == "Windows"

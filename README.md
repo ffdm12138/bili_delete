@@ -6,7 +6,7 @@
 
 ```bash
 # 1. 安装依赖
-pip install requests pycryptodome pywin32
+pip install requests pycryptodomex pywin32
 
 # 2. 试运行（仅扫描不删除）
 python delete.py
