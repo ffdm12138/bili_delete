@@ -1306,7 +1306,7 @@ class TestDeleteDynamicTotalFunction:
         cleaner = BilibiliLotteryCleaner("DedeUserID=1; bili_jct=abc; SESSDATA=x")
         ok, err = cleaner.delete_dynamic({"id_str": "1"})
         assert not ok
-        assert "缺少" in err
+        assert "bad_params" in err
 
     def test_empty_dyn_type(self):
         from delete import BilibiliLotteryCleaner
@@ -1522,3 +1522,201 @@ class TestApiBoundary:
 
                 mock_del.assert_not_called()
                 assert cleaner.stats["skipped_unknown"] >= 1
+
+
+# ===================================================================
+# 17. delete_dynamic total function (P1-2 extended)
+# ===================================================================
+
+
+class TestDeleteDynamicTotalExtended:
+    """Full coverage: every bad input must return (False, reason)."""
+
+    def test_item_is_none(self):
+        from delete import BilibiliLotteryCleaner
+        cleaner = BilibiliLotteryCleaner("DedeUserID=1; bili_jct=abc; SESSDATA=x")
+        ok, err = cleaner.delete_dynamic(None)
+        assert not ok
+        assert "bad_item" in err
+
+    def test_item_is_list(self):
+        from delete import BilibiliLotteryCleaner
+        cleaner = BilibiliLotteryCleaner("DedeUserID=1; bili_jct=abc; SESSDATA=x")
+        ok, err = cleaner.delete_dynamic([])
+        assert not ok
+        assert "bad_item" in err
+
+    def test_params_is_none(self):
+        from delete import BilibiliLotteryCleaner
+        cleaner = BilibiliLotteryCleaner("DedeUserID=1; bili_jct=abc; SESSDATA=x")
+        ok, err = cleaner.delete_dynamic({"params": None})
+        assert not ok
+        assert "bad_params" in err
+
+    def test_params_is_string(self):
+        from delete import BilibiliLotteryCleaner
+        cleaner = BilibiliLotteryCleaner("DedeUserID=1; bili_jct=abc; SESSDATA=x")
+        ok, err = cleaner.delete_dynamic({"params": "bad"})
+        assert not ok
+        assert "bad_params" in err
+
+    def test_http_error_returns_false(self):
+        from delete import BilibiliLotteryCleaner
+        import requests as req
+        cleaner = BilibiliLotteryCleaner("DedeUserID=1; bili_jct=abc; SESSDATA=x")
+        with patch.object(cleaner.session, "post") as mock_post:
+            mock_post.side_effect = req.HTTPError("server error")
+            ok, err = cleaner.delete_dynamic({
+                "params": {"dyn_id_str": "123", "rid_str": "456", "dyn_type": 1},
+            })
+            assert not ok
+            assert "http_error" in err
+
+    def test_unexpected_exception_returns_false(self):
+        from delete import BilibiliLotteryCleaner
+        cleaner = BilibiliLotteryCleaner("DedeUserID=1; bili_jct=abc; SESSDATA=x")
+        with patch.object(cleaner.session, "post") as mock_post:
+            mock_post.side_effect = RuntimeError("boom")
+            ok, err = cleaner.delete_dynamic({
+                "params": {"dyn_id_str": "123", "rid_str": "456", "dyn_type": 1},
+            })
+            assert not ok
+            assert "unexpected" in err
+
+
+# ===================================================================
+# 18. API code safe int (P1-3 extended)
+# ===================================================================
+
+
+class TestSafeCodeParsing:
+    """String codes should be treated the same as int codes."""
+
+    def test_dynamics_code_string_zero(self):
+        from delete import BilibiliLotteryCleaner
+        cleaner = BilibiliLotteryCleaner("DedeUserID=1; bili_jct=abc; SESSDATA=x")
+        with patch.object(cleaner.session, "get") as mock_get:
+            mock_resp = Mock()
+            mock_resp.raise_for_status.return_value = None
+            mock_resp.json.return_value = {
+                "code": "0",
+                "data": {"items": [], "has_more": False},
+            }
+            mock_get.return_value = mock_resp
+            items, offset = cleaner.get_dynamics()
+            assert items == []
+            assert offset is None
+
+    def test_dynamics_code_string_minus_412(self):
+        from delete import BilibiliLotteryCleaner
+        cleaner = BilibiliLotteryCleaner("DedeUserID=1; bili_jct=abc; SESSDATA=x")
+        with patch.object(cleaner.session, "get") as mock_get:
+            mock_resp = Mock()
+            mock_resp.raise_for_status.return_value = None
+            mock_resp.json.return_value = {"code": "-412", "message": "拒绝"}
+            mock_get.return_value = mock_resp
+            with pytest.raises(RateLimitError):
+                cleaner.get_dynamics()
+
+    def test_lottery_code_string_zero(self):
+        from delete import BilibiliLotteryCleaner
+        cleaner = BilibiliLotteryCleaner("DedeUserID=1; bili_jct=abc; SESSDATA=x")
+        with patch.object(cleaner.session, "get") as mock_get:
+            mock_resp = Mock()
+            mock_resp.raise_for_status.return_value = None
+            mock_resp.json.return_value = {
+                "code": "0",
+                "data": {"lottery_status": 1},
+            }
+            mock_get.return_value = mock_resp
+            result = cleaner.get_lottery_info("123")
+            assert result.error_type is None
+            assert result.info is not None
+            assert result.info["lottery_status"] == 1
+
+    def test_lottery_code_string_minus_412(self):
+        from delete import BilibiliLotteryCleaner
+        cleaner = BilibiliLotteryCleaner("DedeUserID=1; bili_jct=abc; SESSDATA=x")
+        with patch.object(cleaner.session, "get") as mock_get:
+            mock_resp = Mock()
+            mock_resp.raise_for_status.return_value = None
+            mock_resp.json.return_value = {"code": "-412", "message": "限流"}
+            mock_get.return_value = mock_resp
+            result = cleaner.get_lottery_info("123")
+            assert result.error_type == "api_code"
+            assert result.code == -412
+
+
+# ===================================================================
+# 19. Cookie success path regression (P1-4)
+# ===================================================================
+
+
+class TestCookieSuccessPath:
+    """Verify _decrypt_chromium_cookies returns non-None on success."""
+
+    def test_decrypt_chromium_cookies_success(self, tmp_path, monkeypatch):
+        """End-to-end: sqlite + fake local state + mock decryption."""
+        import sqlite3
+        import json as _json
+
+        # Inject fake Windows crypto modules before the function imports them
+        fake_win32crypt = Mock()
+        fake_cryptodome = Mock()
+        fake_cryptodome.Cipher = Mock()
+        sys.modules["win32crypt"] = fake_win32crypt
+        sys.modules["Cryptodome"] = fake_cryptodome
+        sys.modules["Cryptodome.Cipher"] = fake_cryptodome.Cipher
+
+        fake_key = b"\x00" * 32
+        fake_win32crypt.CryptUnprotectData.return_value = (None, fake_key)
+        fake_cipher = Mock()
+        fake_cipher.decrypt_and_verify.return_value = b"\x00" * 32 + b"fake_cookie"
+        fake_cryptodome.Cipher.AES.new.return_value = fake_cipher
+
+        db_path = str(tmp_path / "Cookies")
+        ls_path = str(tmp_path / "Local State")
+        with open(ls_path, "w", encoding="utf-8") as f:
+            _json.dump({"os_crypt": {"encrypted_key": "RFBBUE" + ("A" * 198)}}, f)
+
+        conn = sqlite3.connect(db_path)
+        conn.execute("CREATE TABLE cookies (host_key TEXT, name TEXT, encrypted_value BLOB)")
+        conn.execute("INSERT INTO cookies VALUES ('.bilibili.com', 'DedeUserID', ?)", (b"v10" + b"\x00" * 40,))
+        conn.execute("INSERT INTO cookies VALUES ('.bilibili.com', 'bili_jct', ?)", (b"v10" + b"\x00" * 40,))
+        conn.commit()
+        conn.close()
+
+        from delete import _decrypt_chromium_cookies
+        result = _decrypt_chromium_cookies(db_path, ls_path, prefix_32=False)
+
+        assert result is not None
+        assert "DedeUserID=" in result
+        assert "bili_jct=" in result
+
+    def test_decrypt_chromium_cookies_missing_cookies(self, tmp_path):
+        """No bilibili rows → should return None, not error."""
+        import sqlite3
+        import json as _json
+
+        fake_win32crypt = Mock()
+        fake_cryptodome = Mock()
+        fake_cryptodome.Cipher = Mock()
+        sys.modules["win32crypt"] = fake_win32crypt
+        sys.modules["Cryptodome"] = fake_cryptodome
+        sys.modules["Cryptodome.Cipher"] = fake_cryptodome.Cipher
+        fake_win32crypt.CryptUnprotectData.return_value = (None, b"\x00" * 32)
+
+        db_path = str(tmp_path / "Cookies")
+        ls_path = str(tmp_path / "Local State")
+        with open(ls_path, "w", encoding="utf-8") as f:
+            _json.dump({"os_crypt": {"encrypted_key": "RFBBUE" + ("A" * 198)}}, f)
+
+        conn = sqlite3.connect(db_path)
+        conn.execute("CREATE TABLE cookies (host_key TEXT, name TEXT, encrypted_value BLOB)")
+        conn.commit()
+        conn.close()
+
+        from delete import _decrypt_chromium_cookies
+        result = _decrypt_chromium_cookies(db_path, ls_path)
+
+        assert result is None

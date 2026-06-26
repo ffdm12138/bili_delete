@@ -21,6 +21,7 @@ venv/
 
 # Sync pack output
 *.zip
+PROJECT_SNAPSHOT_*.md
 
 # OS
 Thumbs.db

@@ -2,11 +2,11 @@
 
 ## 项目概述
 
-自动扫描当前 B 站账号的全部动态，识别已开奖的互动抽奖动态并批量删除。同时检测原动态已失效的转发动态。
+自动扫描当前 B 站账号的全部动态，识别已开奖的互动抽奖动态并批量删除。可选检测原动态已失效的转发动态（需显式传入 `--include-invalid-repost`）。
 
 ## 技术栈
 
-- **Python 3.13+** — 1,400 行，纯函数 + 类设计
+- **Python 3.13+** — ~1,600 行，纯函数 + 类设计
 - **requests** — HTTP 请求，带 retry/backoff
 - **pycryptodome + pywin32** — AES-GCM 解密 Chromium 系浏览器 cookie
 - **browser-cookie3** — 备用读取 Firefox cookie
@@ -16,7 +16,7 @@
 
 ```
 bili_delete/
-├── delete.py            # 主脚本（1,408 行）
+├── delete.py            # 主脚本（~1,600 行）
 ├── tests/
 │   ├── __init__.py
 │   └── test_delete.py   # 85 个测试用例
@@ -160,21 +160,19 @@ SQL 查询: `host_key LIKE '%bilibili.com'`（覆盖所有子域名，不限于 
 ## 测试
 
 ```bash
-pytest tests/ -v        # 85 个测试，覆盖纯函数 + mock API + 集成流程
+pytest tests/ -v        # 131 个测试，~0.3s 完成（已消除真实 sleep）
 ```
 
 测试覆盖：
-- Cookie 字符串解析（6 个用例）
-- `LotteryState` 全分支：显式状态、时间推断、UNKNOWN、bad timestamp（16 个用例）
-- 抽奖检测：深层搜索、字段匹配、正则（13 个用例）
-- 失效转发检测（9 个用例）
-- 文本预览与时间提取（5 个用例）
-- `CandidateInfo` 脱敏导出（4 个用例）
-- CLI argparse 全模式（8 个用例）
-- Mock API 错误处理（6 个用例）
-- `process_dynamics` 集成测试：dry_run 不删、UNKNOWN 不删、Active 不删、Finished 删、失效转发删、API 失败不静默结束（7 个用例）
-- 异常继承体系（2 个用例）
-- UID 脱敏 + 时间格式化（6 个用例）
+- Cookie 解析、抽奖检测（深层搜索/字段/正则）、失效转发检测
+- `LotteryState` 全分支 + `or` 吃 0/False 回归
+- `delete_dynamic` total function（非 dict、None params、HTTPError、异常）
+- `_decrypt_chromium_cookies` 成功路径回归
+- `CandidateInfo` 脱敏导出
+- CLI argparse 全模式 + `main()` 冲突退出
+- Mock API 错误处理 + API code 字符串安全转换
+- `process_dynamics` 集成：dry_run 不删、UNKNOWN 不删、Active 不删、扫描失败禁删
+- 异常继承体系、UID 脱敏、时间格式化
 
 ## 维护
 
