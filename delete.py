@@ -12,6 +12,7 @@ import os
 import sys
 import json
 import re
+import platform
 from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple, Any
@@ -353,19 +354,69 @@ class BilibiliLotteryCleaner:
         print(f"{'='*60}")
 
 
+def get_bilibili_cookies() -> str:
+    """从本地浏览器直接读取bilibili.com的cookie，不落盘"""
+    try:
+        import browser_cookie3
+    except ImportError:
+        print("❌ 需要安装 browser-cookie3: pip install browser-cookie3")
+        sys.exit(1)
+
+    browsers = []
+    system = platform.system()
+
+    if system == "Windows":
+        browsers = [
+            ("Chrome", browser_cookie3.chrome),
+            ("Edge", browser_cookie3.edge),
+            ("Firefox", browser_cookie3.firefox),
+        ]
+    elif system == "Darwin":
+        browsers = [
+            ("Chrome", browser_cookie3.chrome),
+            ("Firefox", browser_cookie3.firefox),
+            ("Safari", browser_cookie3.safari),
+        ]
+    else:
+        browsers = [
+            ("Chrome", browser_cookie3.chrome),
+            ("Firefox", browser_cookie3.firefox),
+        ]
+
+    for name, loader in browsers:
+        try:
+            cj = loader(domain_name="bilibili.com")
+            if cj is None or len(list(cj)) == 0:
+                continue
+
+            cookies_dict = {}
+            for cookie in cj:
+                if "bilibili" in cookie.domain:
+                    cookies_dict[cookie.name] = cookie.value
+
+            if "DedeUserID" not in cookies_dict or "bili_jct" not in cookies_dict:
+                continue
+
+            cookie_str = "; ".join(f"{k}={v}" for k, v in cookies_dict.items())
+            print(f"✅ 已从 {name} 浏览器读取到 {len(cookies_dict)} 个bilibili cookie")
+            print(f"   DedeUserID: {cookies_dict.get('DedeUserID', '???')}")
+            print(f"   cookie 仅内存暂存，不会写入任何文件")
+            return cookie_str
+
+        except Exception:
+            continue
+
+    print("❌ 未在本地浏览器中找到bilibili登录cookie")
+    print("   请确保已在Chrome/Edge/Firefox中登录bilibili.com")
+    sys.exit(1)
+
+
 def main():
     print("Bilibili Lottery Dynamic Cleaner - JSON Format")
     print("="*60)
-    
-    cookie_file = Path("./cookie.txt")
-    if not cookie_file.exists():
-        print("❌ 未找到 cookie.txt")
-        sys.exit(1)
-    
-    cookie = cookie_file.read_text(encoding='utf-8').strip()
-    if not cookie:
-        print("❌ cookie为空")
-        sys.exit(1)
+
+    # 直接从浏览器读取cookie，不落盘
+    cookie = get_bilibili_cookies()
     
     debug = input("调试模式? (y/n, 默认n): ").strip().lower() == 'y'
     
