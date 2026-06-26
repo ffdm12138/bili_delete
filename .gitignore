@@ -19,6 +19,9 @@ __pycache__/
 venv/
 *.log
 
+# Sync pack output
+*.zip
+
 # OS
 Thumbs.db
 .DS_Store
