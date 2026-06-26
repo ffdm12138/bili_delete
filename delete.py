@@ -107,7 +107,7 @@ class CandidateInfo:
     text_preview: str = ""
     dynamic_url: str = ""
     is_repost_invalid: bool = False
-    raw_item: Optional[Dict[str, Any]] = None  # only populated for require_confirm path
+    raw_item: Optional[Dict[str, Any]] = None  # always populated during scan, used for deletion
 
     def sanitized_dict(self) -> Dict[str, Any]:
         """Return a dict safe for JSON export — no cookies or sensitive fields."""
@@ -167,6 +167,14 @@ def _now_shanghai() -> datetime:
 def _utcfromtimestamp(ts: float) -> datetime:
     """Convert a Unix timestamp to a timezone-aware datetime in Shanghai."""
     return datetime.fromtimestamp(ts, tz=TZ_SHANGHAI)
+
+
+def _safe_int_code(value: Any, default: int = -999999) -> int:
+    """Safely convert an API code value to int."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
 
 
 def _sanitize_for_log(value: str) -> str:
@@ -597,10 +605,10 @@ class BilibiliLotteryCleaner:
                 raise AuthError("Cookie 已过期或未登录，请重新登录 bilibili.com") from e
             raise NetworkError(f"{label} HTTP {status}") from e
 
-        # Parse JSON
+        # Parse JSON (catch both json.JSONDecodeError and ValueError)
         try:
             data = resp.json()
-        except json.JSONDecodeError as e:
+        except (json.JSONDecodeError, ValueError) as e:
             raise ApiError(-1, f"响应不是有效 JSON: {e}", url) from e
 
         code = data.get("code")
@@ -610,7 +618,7 @@ class BilibiliLotteryCleaner:
                 raise AuthError(f"未登录或 Cookie 已过期: {msg}")
             if code == -412:
                 raise RateLimitError(f"被风控/限流: {msg}")
-            raise ApiError(int(code), str(msg), url)
+            raise ApiError(_safe_int_code(code), str(msg), url)
 
         response_data = data.get("data", {})
         items = response_data.get("items", [])
@@ -658,9 +666,23 @@ class BilibiliLotteryCleaner:
 
         try:
             data = resp.json()
-        except json.JSONDecodeError as e:
+        except (json.JSONDecodeError, ValueError) as e:
             result = LotteryQueryResult(
                 error_type="json_decode",
+                message=str(e),
+            )
+            self._lottery_cache[orig_id] = result
+            return result
+        except requests.HTTPError as e:
+            result = LotteryQueryResult(
+                error_type="http_error",
+                message=str(e),
+            )
+            self._lottery_cache[orig_id] = result
+            return result
+        except Exception as e:
+            result = LotteryQueryResult(
+                error_type="unexpected",
                 message=str(e),
             )
             self._lottery_cache[orig_id] = result
@@ -672,7 +694,7 @@ class BilibiliLotteryCleaner:
         elif code is not None and code != 0:
             result = LotteryQueryResult(
                 error_type="api_code",
-                code=int(code),
+                code=_safe_int_code(code),
                 message=str(data.get("message", "")),
             )
         else:
@@ -719,10 +741,10 @@ class BilibiliLotteryCleaner:
         return state, lottery_time, reason
 
     def delete_dynamic(self, item: Dict) -> Tuple[bool, str]:
-        """Delete a single dynamic.
+        """Delete a single dynamic.  Total function: never raises.
 
-        Only deletes when ``item.params`` contains all required fields.
-        Missing parameters → skip safely.
+        Only deletes when ``item.params`` contains all required fields
+        with non-empty values.  Any bad parameter → ``(False, reason)``.
 
         Returns:
             (success: bool, error_message: str)
@@ -733,13 +755,25 @@ class BilibiliLotteryCleaner:
         required = ["dyn_id_str", "rid_str", "dyn_type"]
         if not all(k in item_params for k in required):
             dyn_id = str(item.get("id_str", "?"))[:18]
-            msg = f"缺少删除参数，安全跳过"
+            msg = "缺少删除参数，安全跳过"
             print(f"   ⚠️  {msg}: {dyn_id}")
             return False, msg
 
-        dyn_id_str = str(item_params["dyn_id_str"])
-        rid_str = str(item_params["rid_str"])
-        dyn_type = int(item_params["dyn_type"])
+        dyn_id_str = str(item_params.get("dyn_id_str", ""))
+        rid_str = str(item_params.get("rid_str", ""))
+        dyn_type_raw = item_params.get("dyn_type")
+
+        if not dyn_id_str or not rid_str:
+            msg = "删除参数为空，安全跳过"
+            print(f"   ⚠️  {msg}: dyn_id={dyn_id_str[:18]}")
+            return False, "bad_delete_params"
+
+        try:
+            dyn_type = int(dyn_type_raw)
+        except (TypeError, ValueError):
+            msg = f"dyn_type 无效值: {dyn_type_raw!r}"
+            print(f"   ⚠️  {msg}")
+            return False, "bad_dyn_type"
 
         url_params = {"platform": "web", "csrf": self.csrf}
         json_payload = {
@@ -764,7 +798,7 @@ class BilibiliLotteryCleaner:
 
         try:
             result = resp.json()
-        except json.JSONDecodeError as e:
+        except (json.JSONDecodeError, ValueError) as e:
             msg = f"删除响应非 JSON: {e}"
             print(f"   ❌ {msg}")
             return False, msg
@@ -809,6 +843,8 @@ class BilibiliLotteryCleaner:
         page = 1
         candidates: List[CandidateInfo] = []
         failed_pages = 0
+        scan_failed = False    # any page-level error → block deletion
+        scan_item_errors = 0   # per-item processing errors
 
         print(f"\n{'=' * 60}")
         print(f"🚀 B站抽奖动态清理工具")
@@ -830,13 +866,17 @@ class BilibiliLotteryCleaner:
                 items, new_offset = self.get_dynamics(offset)
             except AuthError as e:
                 print(f"   ❌ 认证失败: {e}")
+                scan_failed = True
+                failed_pages += 1
                 break
             except RateLimitError as e:
                 print(f"   ❌ 被限流: {e}")
+                scan_failed = True
                 failed_pages += 1
                 break
             except (ApiError, NetworkError) as e:
                 print(f"   ❌ 获取失败: {e}")
+                scan_failed = True
                 failed_pages += 1
                 break
 
@@ -923,6 +963,7 @@ class BilibiliLotteryCleaner:
 
                 except Exception as e:
                     print(f"\n   ❌ 处理动态异常: {e}")
+                    scan_item_errors += 1
                     if self.debug:
                         import traceback
                         traceback.print_exc()
@@ -944,10 +985,27 @@ class BilibiliLotteryCleaner:
             if export_candidates:
                 self._export_candidates_json(candidates)
 
+        # ── Scan integrity warning ──
+        if scan_failed or scan_item_errors > 0:
+            print(f"\n⚠️  扫描不完整: ", end="")
+            if scan_failed:
+                print(f"{failed_pages} 页获取失败", end="")
+            if scan_item_errors > 0:
+                if scan_failed:
+                    print(f", ", end="")
+                print(f"{scan_item_errors} 条动态处理异常", end="")
+            print()
+            if dry_run:
+                print(f"   试运行模式，候选仅供参考")
+            else:
+                print(f"   正式模式，本轮禁止执行删除。请稍后重试。")
+
         # ================================================================
-        # PHASE 3: Action (only when NOT dry_run AND candidates exist)
+        # PHASE 3: Action (only when NOT dry_run AND candidates exist
+        #          AND scan was clean)
         # ================================================================
-        if not dry_run and candidates:
+        scan_clean = not scan_failed and scan_item_errors == 0
+        if not dry_run and candidates and scan_clean:
             if require_confirm:
                 # --execute (no --yes): input DELETE after table
                 self._confirm_and_delete(candidates)
@@ -959,6 +1017,12 @@ class BilibiliLotteryCleaner:
                     time.sleep(1)
                 print()
                 self._execute_deletion(candidates)
+        elif not dry_run and candidates and not scan_clean:
+            # Log the block
+            self._log_debug(
+                f"删除被拦截: scan_failed={scan_failed}, "
+                f"scan_item_errors={scan_item_errors}"
+            )
 
         # ================================================================
         # Statistics
@@ -1018,7 +1082,7 @@ class BilibiliLotteryCleaner:
 
     def _export_candidates_json(self, candidates: List[CandidateInfo]) -> None:
         """Export sanitized candidate list to a JSON file."""
-        timestamp = _now_shanghai().strftime("%Y%m%d_%H%M")
+        timestamp = _now_shanghai().strftime("%Y%m%d_%H%M%S")
         filename = f"{CANDIDATE_EXPORT_PREFIX}{timestamp}.json"
         filepath = Path(filename)
 

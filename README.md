@@ -76,7 +76,8 @@ python delete.py --include-invalid-repost
 ## 功能特性
 
 - **🔒 Cookie 仅内存暂存** — 从浏览器 SQLite 数据库读取后暂存于内存，不会写入项目目录
-- **🎯 五层检测** — 关键词递归搜索 + 字段匹配 + 正则 + 失效转发检测 + API 验证
+- **🎯 抽奖检测** — 关键词递归搜索 + 字段匹配 + 正则 + API 验证
+- **🔗 可选扩展** — 失效转发检测（需 `--include-invalid-repost`，默认关闭）
 - **⏳ 智能跳过** — 未开奖动态自动保留，已开奖带 2 小时安全缓冲才判定
 - **🛡️ 安全优先** — 状态不明（UNKNOWN）一律不删；未知状态值不靠时间猜；扫描阶段绝不删除
 - **🔐 安全删除** — 缺少 B 站返回的删除参数时跳过，不猜参数（宁可漏删）
@@ -155,5 +156,6 @@ bili_delete/
 
 ## 维护
 
-- 仓库: https://gitee.com/adam121389/bili_delete.git
+- 仓库 GitHub: https://github.com/ffdm12138/bili_delete
+- 仓库 Gitee: https://gitee.com/adam121389/bili_delete.git
 - 分支: `main`

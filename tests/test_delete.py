@@ -749,6 +749,11 @@ class TestErrorHandling:
 class TestProcessDynamics:
     """Mock-the-network tests for the main process_dynamics flow."""
 
+    @pytest.fixture(autouse=True)
+    def _no_sleep(self, monkeypatch):
+        """Eliminate all real sleeps in process_dynamics tests."""
+        monkeypatch.setattr(time, "sleep", lambda *_: None)
+
     def test_dry_run_never_deletes(self, sample_lottery_item):
         from delete import BilibiliLotteryCleaner
 
@@ -1031,11 +1036,9 @@ class TestProcessDynamics:
                     # Return (False, "error") — must NOT be treated as success
                     mock_delete.return_value = (False, "api error")
 
-                    with patch.object(time, "sleep", lambda _: None):
-                        with patch.object(cleaner, "_random_delay", lambda *a, **kw: None):
-                            cleaner.process_dynamics(
-                                dry_run=False, require_confirm=False,
-                            )
+                    cleaner.process_dynamics(
+                        dry_run=False, require_confirm=False,
+                    )
 
                 assert cleaner.stats["deleted"] == 0, (
                     "BUG: (False, 'error') treated as True due to tuple truthiness"
@@ -1145,3 +1148,377 @@ class TestTimeHelpers:
         now = _now_shanghai()
         assert now.tzinfo is not None
         assert now.utcoffset() == timedelta(hours=8)
+
+
+# ===================================================================
+# 13. Scan-failure blocks deletion (P1-1 regression)
+# ===================================================================
+
+
+class TestScanFailureBlocksDeletion:
+    """When any page fails during scan, deletion must be blocked."""
+
+    @pytest.fixture(autouse=True)
+    def _no_sleep(self, monkeypatch):
+        monkeypatch.setattr(time, "sleep", lambda *_: None)
+
+    def test_network_error_blocks_deletion(self, sample_lottery_item):
+        from delete import BilibiliLotteryCleaner
+
+        cleaner = BilibiliLotteryCleaner(
+            "DedeUserID=1; bili_jct=abc; SESSDATA=x"
+        )
+
+        # Page 1 succeeds with candidate, page 2 fails
+        with patch.object(cleaner, "get_dynamics") as mock_get:
+            mock_get.side_effect = [
+                ([sample_lottery_item], "offset2"),  # page 1 ok
+                NetworkError("连接超时"),              # page 2 fails
+            ]
+
+            with patch.object(cleaner, "get_lottery_info") as mock_lottery:
+                mock_lottery.return_value = LotteryQueryResult(info={
+                    "lottery_status": "1",
+                    "lottery_time": (
+                        datetime.now(TZ_SHANGHAI) - timedelta(days=7)
+                    ).timestamp(),
+                })
+
+                with patch.object(cleaner, "delete_dynamic") as mock_delete:
+                    with patch.object(cleaner, "_confirm_and_delete") as mock_confirm:
+                        with patch.object(cleaner, "_execute_deletion") as mock_exec:
+                            cleaner.process_dynamics(
+                                dry_run=False, require_confirm=True,
+                            )
+
+                # Must NOT call any deletion
+                mock_delete.assert_not_called()
+                mock_exec.assert_not_called()
+                # _confirm_and_delete might be patched, but the gate fires before it
+
+    def test_rate_limit_blocks_deletion(self, sample_lottery_item):
+        from delete import BilibiliLotteryCleaner
+
+        cleaner = BilibiliLotteryCleaner(
+            "DedeUserID=1; bili_jct=abc; SESSDATA=x"
+        )
+
+        with patch.object(cleaner, "get_dynamics") as mock_get:
+            mock_get.side_effect = [
+                ([sample_lottery_item], "offset2"),
+                RateLimitError("被限流"),
+            ]
+
+            with patch.object(cleaner, "get_lottery_info") as mock_lottery:
+                mock_lottery.return_value = LotteryQueryResult(info={
+                    "lottery_status": "1",
+                    "lottery_time": (
+                        datetime.now(TZ_SHANGHAI) - timedelta(days=7)
+                    ).timestamp(),
+                })
+
+                with patch.object(cleaner, "delete_dynamic") as mock_delete:
+                    cleaner.process_dynamics(
+                        dry_run=False, require_confirm=False,
+                    )
+
+                mock_delete.assert_not_called()
+
+    def test_dry_run_still_shows_candidates_on_failure(self, sample_lottery_item):
+        """Even with scan failure, dry-run should display candidates."""
+        from delete import BilibiliLotteryCleaner
+
+        cleaner = BilibiliLotteryCleaner(
+            "DedeUserID=1; bili_jct=abc; SESSDATA=x"
+        )
+
+        with patch.object(cleaner, "get_dynamics") as mock_get:
+            mock_get.side_effect = [
+                ([sample_lottery_item], "offset2"),
+                NetworkError("连接超时"),
+            ]
+
+            with patch.object(cleaner, "get_lottery_info") as mock_lottery:
+                mock_lottery.return_value = LotteryQueryResult(info={
+                    "lottery_status": "1",
+                    "lottery_time": (
+                        datetime.now(TZ_SHANGHAI) - timedelta(days=7)
+                    ).timestamp(),
+                })
+
+                with patch.object(cleaner, "_print_candidates_table") as mock_table:
+                    cleaner.process_dynamics(dry_run=True, require_confirm=False)
+
+                # dry-run must still show candidates
+                mock_table.assert_called_once()
+
+    def test_item_error_blocks_deletion(self, sample_lottery_item):
+        """Per-item exception should set scan_item_errors and block deletion."""
+        from delete import BilibiliLotteryCleaner, is_lottery_dynamic
+
+        cleaner = BilibiliLotteryCleaner(
+            "DedeUserID=1; bili_jct=abc; SESSDATA=x"
+        )
+
+        call_count = [0]
+        def _bomb_then_normal(item):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                raise RuntimeError("simulated item error")
+            return is_lottery_dynamic(item)
+
+        with patch.object(cleaner, "get_dynamics") as mock_get:
+            # Two items: first will blow up in patched is_lottery_dynamic
+            mock_get.return_value = (
+                [{"id_str": "bad123", "orig": {"id_str": "x"}},
+                 sample_lottery_item],
+                None,
+            )
+
+            with patch("delete.is_lottery_dynamic", _bomb_then_normal):
+                with patch.object(cleaner, "get_lottery_info") as mock_lottery:
+                    mock_lottery.return_value = LotteryQueryResult(info={
+                        "lottery_status": "1",
+                        "lottery_time": (
+                            datetime.now(TZ_SHANGHAI) - timedelta(days=7)
+                        ).timestamp(),
+                    })
+
+                    with patch.object(cleaner, "delete_dynamic") as mock_delete:
+                        cleaner.process_dynamics(
+                            dry_run=False, require_confirm=False,
+                        )
+
+                    # Deletion must be blocked due to item error
+                    mock_delete.assert_not_called()
+
+
+# ===================================================================
+# 14. delete_dynamic total function (P1-2 regression)
+# ===================================================================
+
+
+class TestDeleteDynamicTotalFunction:
+    """delete_dynamic must return (False, reason) for bad params, never raise."""
+
+    def test_missing_params(self):
+        from delete import BilibiliLotteryCleaner
+        cleaner = BilibiliLotteryCleaner("DedeUserID=1; bili_jct=abc; SESSDATA=x")
+        ok, err = cleaner.delete_dynamic({"id_str": "1"})
+        assert not ok
+        assert "缺少" in err
+
+    def test_empty_dyn_type(self):
+        from delete import BilibiliLotteryCleaner
+        cleaner = BilibiliLotteryCleaner("DedeUserID=1; bili_jct=abc; SESSDATA=x")
+        ok, err = cleaner.delete_dynamic({
+            "params": {"dyn_id_str": "123", "rid_str": "456", "dyn_type": ""},
+        })
+        assert not ok
+        assert "bad_dyn_type" in err
+
+    def test_none_dyn_type(self):
+        from delete import BilibiliLotteryCleaner
+        cleaner = BilibiliLotteryCleaner("DedeUserID=1; bili_jct=abc; SESSDATA=x")
+        ok, err = cleaner.delete_dynamic({
+            "params": {"dyn_id_str": "123", "rid_str": "456", "dyn_type": None},
+        })
+        assert not ok
+        assert "bad_dyn_type" in err
+
+    def test_empty_dyn_id_str(self):
+        from delete import BilibiliLotteryCleaner
+        cleaner = BilibiliLotteryCleaner("DedeUserID=1; bili_jct=abc; SESSDATA=x")
+        ok, err = cleaner.delete_dynamic({
+            "params": {"dyn_id_str": "", "rid_str": "456", "dyn_type": 1},
+        })
+        assert not ok
+        assert "bad_delete_params" in err or "参数为空" in err
+
+    def test_empty_rid_str(self):
+        from delete import BilibiliLotteryCleaner
+        cleaner = BilibiliLotteryCleaner("DedeUserID=1; bili_jct=abc; SESSDATA=x")
+        ok, err = cleaner.delete_dynamic({
+            "params": {"dyn_id_str": "123", "rid_str": "", "dyn_type": 1},
+        })
+        assert not ok
+        assert "bad_delete_params" in err or "参数为空" in err
+
+    def test_valid_params_attempts_delete(self):
+        """Valid params should proceed to HTTP call (which will fail but not crash)."""
+        from delete import BilibiliLotteryCleaner
+        cleaner = BilibiliLotteryCleaner("DedeUserID=1; bili_jct=abc; SESSDATA=x")
+        with patch.object(cleaner.session, "post") as mock_post:
+            import requests as req
+            mock_resp = Mock()
+            mock_resp.raise_for_status.return_value = None
+            mock_resp.json.return_value = {"code": 0}
+            mock_post.return_value = mock_resp
+
+            ok, err = cleaner.delete_dynamic({
+                "params": {"dyn_id_str": "123", "rid_str": "456", "dyn_type": 1},
+            })
+            assert ok
+
+
+# ===================================================================
+# 15. main() CLI conflict tests (P1-3)
+# ===================================================================
+
+
+class TestMainCLIConflicts:
+    """Verify main() properly exits on conflicting arguments."""
+
+    def test_dry_run_and_execute_conflict(self, monkeypatch):
+        from delete import main as cli_main
+        monkeypatch.setattr(sys, "argv", ["delete.py", "--dry-run", "--execute"])
+        with pytest.raises(SystemExit) as exc:
+            cli_main()
+        assert exc.value.code == 1
+
+    def test_non_interactive_and_execute_conflict(self, monkeypatch):
+        from delete import main as cli_main
+        monkeypatch.setattr(sys, "argv", [
+            "delete.py", "--non-interactive", "--execute",
+        ])
+        with pytest.raises(SystemExit) as exc:
+            cli_main()
+        assert exc.value.code == 1
+
+    def test_yes_without_execute_does_not_delete(self, monkeypatch):
+        from delete import main as cli_main, BilibiliLotteryCleaner
+        monkeypatch.setattr(sys, "argv", ["delete.py", "--yes"])
+
+        with patch("delete.get_bilibili_cookies") as mock_cookies:
+            mock_cookies.return_value = "DedeUserID=1; bili_jct=abc; SESSDATA=x"
+            with patch.object(BilibiliLotteryCleaner, "process_dynamics") as mock_proc:
+                with patch("builtins.input", return_value=""):
+                    try:
+                        cli_main()
+                    except SystemExit:
+                        pass
+
+                if mock_proc.called:
+                    kwargs = mock_proc.call_args.kwargs
+                    assert kwargs.get("dry_run") is True, (
+                        "--yes without --execute must stay dry_run"
+                    )
+
+    def test_default_is_dry_run(self, monkeypatch):
+        from delete import main as cli_main, BilibiliLotteryCleaner
+        monkeypatch.setattr(sys, "argv", ["delete.py"])
+
+        with patch("delete.get_bilibili_cookies") as mock_cookies:
+            mock_cookies.return_value = "DedeUserID=1; bili_jct=abc; SESSDATA=x"
+            with patch.object(BilibiliLotteryCleaner, "process_dynamics") as mock_proc:
+                with patch("builtins.input", return_value=""):
+                    try:
+                        cli_main()
+                    except SystemExit:
+                        pass
+
+                if mock_proc.called:
+                    kwargs = mock_proc.call_args.kwargs
+                    assert kwargs.get("dry_run") is True
+
+    def test_execute_yes_passes_correct_params(self, monkeypatch):
+        from delete import main as cli_main, BilibiliLotteryCleaner
+        monkeypatch.setattr(sys, "argv", ["delete.py", "--execute", "--yes"])
+
+        with patch("delete.get_bilibili_cookies") as mock_cookies:
+            mock_cookies.return_value = "DedeUserID=1; bili_jct=abc; SESSDATA=x"
+            with patch.object(BilibiliLotteryCleaner, "process_dynamics") as mock_proc:
+                with patch("builtins.input", return_value=""):
+                    try:
+                        cli_main()
+                    except SystemExit:
+                        pass
+
+                if mock_proc.called:
+                    kwargs = mock_proc.call_args.kwargs
+                    assert kwargs.get("dry_run") is False
+                    assert kwargs.get("require_confirm") is False
+
+
+# ===================================================================
+# 16. API error boundary tests (P1-6)
+# ===================================================================
+
+
+class TestSafeIntCode:
+    def test_normal_int(self):
+        from delete import _safe_int_code
+        assert _safe_int_code(42) == 42
+
+    def test_string_int(self):
+        from delete import _safe_int_code
+        assert _safe_int_code("42") == 42
+
+    def test_bad_string(self):
+        from delete import _safe_int_code
+        assert _safe_int_code("ERROR") == -999999
+
+    def test_none(self):
+        from delete import _safe_int_code
+        assert _safe_int_code(None) == -999999
+
+    def test_custom_default(self):
+        from delete import _safe_int_code
+        assert _safe_int_code("bad", default=-1) == -1
+
+
+class TestApiBoundary:
+
+    @pytest.fixture(autouse=True)
+    def _no_sleep(self, monkeypatch):
+        monkeypatch.setattr(time, "sleep", lambda *_: None)
+
+    def test_lottery_api_non_json_returns_unknown(self, sample_lottery_item):
+        from delete import BilibiliLotteryCleaner
+        import requests as req
+
+        cleaner = BilibiliLotteryCleaner(
+            "DedeUserID=1; bili_jct=abc; SESSDATA=x"
+        )
+
+        with patch.object(cleaner, "get_dynamics") as mock_get:
+            mock_get.return_value = ([sample_lottery_item], None)
+
+            with patch.object(cleaner.session, "get") as mock_get_req:
+                mock_resp = Mock()
+                mock_resp.raise_for_status.return_value = None
+                mock_resp.json.side_effect = ValueError("not json")
+                mock_get_req.return_value = mock_resp
+
+                with patch.object(cleaner, "delete_dynamic") as mock_del:
+                    cleaner.process_dynamics(
+                        dry_run=False, require_confirm=False,
+                    )
+
+                # Must not crash, must not delete
+                mock_del.assert_not_called()
+                assert cleaner.stats["skipped_unknown"] >= 1
+
+    def test_lottery_api_code_error_string_returns_unknown(self, sample_lottery_item):
+        from delete import BilibiliLotteryCleaner
+
+        cleaner = BilibiliLotteryCleaner(
+            "DedeUserID=1; bili_jct=abc; SESSDATA=x"
+        )
+
+        with patch.object(cleaner, "get_dynamics") as mock_get:
+            mock_get.return_value = ([sample_lottery_item], None)
+
+            with patch.object(cleaner.session, "get") as mock_get_req:
+                mock_resp = Mock()
+                mock_resp.raise_for_status.return_value = None
+                mock_resp.json.return_value = {"code": "ERROR_STRING", "message": "wtf"}
+                mock_get_req.return_value = mock_resp
+
+                with patch.object(cleaner, "delete_dynamic") as mock_del:
+                    cleaner.process_dynamics(
+                        dry_run=False, require_confirm=False,
+                    )
+
+                mock_del.assert_not_called()
+                assert cleaner.stats["skipped_unknown"] >= 1
