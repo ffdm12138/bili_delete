@@ -6,6 +6,7 @@ cookies*.txt
 *.sqlite
 *.sqlite3
 debug_*.json
+candidates_*.json
 *.har
 .env
 .env.*

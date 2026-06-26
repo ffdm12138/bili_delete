@@ -2,3 +2,6 @@ requests
 browser-cookie3
 pycryptodomex
 pywin32; platform_system == "Windows"
+
+# dev / test
+pytest>=7.0
