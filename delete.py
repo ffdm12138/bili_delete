@@ -354,12 +354,104 @@ class BilibiliLotteryCleaner:
         print(f"{'='*60}")
 
 
+def _try_360chrome_x() -> Optional[str]:
+    """尝试从360极速浏览器X读取cookie（32字节前缀的特殊加密）"""
+    import shutil
+    import sqlite3
+    import json as pyjson
+    import base64
+    from win32crypt import CryptUnprotectData
+    from Crypto.Cipher import AES
+
+    cookie_paths = [
+        r"C:\Users\Admin\AppData\Local\360ChromeX\Chrome\User Data\Default\Network\Cookies",
+        os.path.expanduser(r"~\AppData\Local\360ChromeX\Chrome\User Data\Default\Network\Cookies"),
+    ]
+    local_state_paths = [
+        r"C:\Users\Admin\AppData\Local\360ChromeX\Chrome\User Data\Local State",
+        os.path.expanduser(r"~\AppData\Local\360ChromeX\Chrome\User Data\Local State"),
+    ]
+
+    cookie_file = None
+    ls_file = None
+    for p in cookie_paths:
+        if os.path.isfile(p):
+            cookie_file = p
+            break
+    for p in local_state_paths:
+        if os.path.isfile(p):
+            ls_file = p
+            break
+
+    if not cookie_file or not ls_file:
+        return None  # 没找到360浏览器
+
+    try:
+        # 复制Cookie DB（可能被锁）
+        import tempfile
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".db")
+        tmp.close()
+        shutil.copy2(cookie_file, tmp.name)
+
+        # 获取master key
+        with open(ls_file, "r", encoding="utf-8") as f:
+            enc_key = base64.b64decode(pyjson.load(f)["os_crypt"]["encrypted_key"])[5:]
+        master_key = CryptUnprotectData(enc_key, None, None, None, 0)[1]
+
+        # 解密360的cookie（AES-GCM，前32字节是360额外加的）
+        def decrypt_360(enc_val: bytes, key: bytes) -> str:
+            nonce = enc_val[3:15]
+            raw = AES.new(key, AES.MODE_GCM, nonce=nonce).decrypt_and_verify(
+                enc_val[15:-16], enc_val[-16:]
+            )
+            return raw[32:].decode("utf-8")
+
+        cookies_dict = {}
+        conn = sqlite3.connect(tmp.name)
+        conn.text_factory = bytes
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT host_key, name, encrypted_value FROM cookies "
+            "WHERE host_key = '.bilibili.com'"
+        )
+        for host, name, enc_val in cur.fetchall():
+            n = name.decode("utf-8")
+            if enc_val and enc_val[:3] == b"v10":
+                try:
+                    cookies_dict[n] = decrypt_360(enc_val, master_key)
+                except Exception:
+                    pass
+        conn.close()
+        os.unlink(tmp.name)
+
+        if "DedeUserID" in cookies_dict and "bili_jct" in cookies_dict:
+            cookie_str = "; ".join(f"{k}={v}" for k, v in cookies_dict.items())
+            print(f"✅ 已从 360极速浏览器X 读取到 {len(cookies_dict)} 个bilibili cookie")
+            print(f"   DedeUserID: {cookies_dict.get('DedeUserID', '???')}")
+            print(f"   cookie 仅内存暂存，不会写入任何文件")
+            return cookie_str
+    except Exception:
+        try:
+            os.unlink(tmp.name)
+        except Exception:
+            pass
+
+    return None
+
+
 def get_bilibili_cookies() -> str:
     """从本地浏览器直接读取bilibili.com的cookie，不落盘"""
+    # 优先尝试360极速浏览器X（用户当前在用）
+    if platform.system() == "Windows":
+        result = _try_360chrome_x()
+        if result:
+            return result
+
     try:
         import browser_cookie3
     except ImportError:
         print("❌ 需要安装 browser-cookie3: pip install browser-cookie3")
+        print("   也可以手动粘贴cookie，运行: python delete.py --cookie '你的cookie'")
         sys.exit(1)
 
     browsers = []
@@ -407,7 +499,7 @@ def get_bilibili_cookies() -> str:
             continue
 
     print("❌ 未在本地浏览器中找到bilibili登录cookie")
-    print("   请确保已在Chrome/Edge/Firefox中登录bilibili.com")
+    print("   请确保已在Chrome/Edge/Firefox/360极速浏览器X中登录bilibili.com")
     sys.exit(1)
 
 
