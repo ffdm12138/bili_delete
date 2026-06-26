@@ -123,6 +123,19 @@ class CandidateInfo:
         }
 
 
+@dataclass
+class LotteryQueryResult:
+    """Result of a lottery status API query, with error tracking."""
+    info: Optional[dict] = None
+    error_type: Optional[str] = None   # "api_code" | "json_decode" | "network" | "empty"
+    code: Optional[int] = None
+    message: str = ""
+
+    @property
+    def is_error(self) -> bool:
+        return self.error_type is not None
+
+
 # ---------------------------------------------------------------------------
 # Utility helpers
 # ---------------------------------------------------------------------------
@@ -266,15 +279,22 @@ def parse_lottery_state(info: Optional[dict]) -> Tuple[LotteryState, str]:
         return LotteryState.UNKNOWN, "empty_info"
 
     # --- Explicit status field ---
+    has_explicit_status = False
     status_raw = info.get("lottery_status") or info.get("status")
     if status_raw is not None:
+        has_explicit_status = True
         s = str(status_raw).strip().lower()
         if s in ("1", "true", "finished", "closed", "drawn"):
             return LotteryState.FINISHED, "api_status"
         if s in ("0", "false", "active", "open", "ongoing"):
             return LotteryState.ACTIVE, "api_status"
-        # Unrecognised explicit status → don't guess, go to time fallback
-        # but if time fallback also fails, return UNKNOWN
+        # Unrecognised explicit status — UNKNOWN, do NOT fall through to time.
+        # Reason: new/unknown status values may mean "cancelled", "error",
+        # "restricted", etc.  Time-based deletion is unsafe here.
+        return LotteryState.UNKNOWN, f"unknown_status:{s}"
+
+    # --- Time-based fallback (only when NO explicit status exists) ---
+    assert not has_explicit_status  # safety: we only get here without explicit status
 
     # --- Time-based fallback ---
     lottery_ts = info.get("lottery_time")
@@ -506,7 +526,7 @@ class BilibiliLotteryCleaner:
         self.session.headers.update(self.headers)
 
         # Lottery info cache (avoid duplicate API calls)
-        self._lottery_cache: Dict[str, Optional[dict]] = {}
+        self._lottery_cache: Dict[str, LotteryQueryResult] = {}
 
         self.stats = {
             "total": 0,
@@ -594,8 +614,8 @@ class BilibiliLotteryCleaner:
         self._log_debug(f"got {len(items)} items, has_more={has_more}, offset={next_offset}")
         return items, next_offset
 
-    def get_lottery_info(self, orig_id: str) -> Optional[dict]:
-        """Query lottery status, with cache.  Returns data dict or None."""
+    def get_lottery_info(self, orig_id: str) -> LotteryQueryResult:
+        """Query lottery status, with cache.  Returns LotteryQueryResult."""
         if orig_id in self._lottery_cache:
             return self._lottery_cache[orig_id]
 
@@ -613,24 +633,39 @@ class BilibiliLotteryCleaner:
 
         try:
             resp = retry_request(_do, label=label)
-        except (NetworkError, RateLimitError):
-            self._lottery_cache[orig_id] = None
+        except (NetworkError, RateLimitError) as e:
+            result = LotteryQueryResult(
+                error_type="network",
+                message=str(e),
+            )
+            self._lottery_cache[orig_id] = result
             print(f"   ⚠️  查询抽奖状态失败 (网络错误)，跳过: {orig_id[:18]}")
-            return None
+            return result
 
         try:
             data = resp.json()
-        except json.JSONDecodeError:
-            self._lottery_cache[orig_id] = None
-            return None
+        except json.JSONDecodeError as e:
+            result = LotteryQueryResult(
+                error_type="json_decode",
+                message=str(e),
+            )
+            self._lottery_cache[orig_id] = result
+            return result
 
-        if data.get("code") == 0 and data.get("data"):
-            info = data["data"]
+        code = data.get("code")
+        if code == 0 and data.get("data"):
+            result = LotteryQueryResult(info=data["data"])
+        elif code is not None and code != 0:
+            result = LotteryQueryResult(
+                error_type="api_code",
+                code=int(code),
+                message=str(data.get("message", "")),
+            )
         else:
-            info = None
+            result = LotteryQueryResult(error_type="empty")
 
-        self._lottery_cache[orig_id] = info
-        return info
+        self._lottery_cache[orig_id] = result
+        return result
 
     # ------------------------------------------------------------------
     # Core logic
@@ -643,8 +678,21 @@ class BilibiliLotteryCleaner:
 
         Returns:
             (LotteryState, lottery_time_or_None, reason_detail)
+            — reason_detail includes error info when the query itself failed.
         """
-        info = self.get_lottery_info(orig_id)
+        result = self.get_lottery_info(orig_id)
+        info = result.info
+
+        # If the query itself failed, surface the error in reason
+        if result.is_error:
+            state, base_reason = parse_lottery_state(info)
+            err_detail = f"{result.error_type}"
+            if result.code is not None:
+                err_detail += f":{result.code}"
+            if result.message:
+                err_detail += f"({result.message[:40]})"
+            return state, None, f"{base_reason}/{err_detail}"
+
         state, reason = parse_lottery_state(info)
 
         lottery_time: Optional[datetime] = None
@@ -727,13 +775,21 @@ class BilibiliLotteryCleaner:
         dry_run: bool = True,
         require_confirm: bool = True,
         export_candidates: bool = False,
+        include_invalid_repost: bool = False,
     ) -> None:
-        """Main loop: paginate → detect → check status → (optional) delete.
+        """Main loop: scan → display → (optional) delete.
+
+        **Delete never happens during the scan phase.**
+        All candidates are collected first, then displayed, and only then
+        (based on mode) either confirmed or deleted after a countdown.
 
         Args:
             dry_run: If True, only scan; never delete.
-            require_confirm: If True (and not dry_run), require DELETE input.
+            require_confirm: If True (and not dry_run), require DELETE input
+                             after the candidate table.
             export_candidates: If True, export sanitized candidates JSON.
+            include_invalid_repost: If True, also target reposts whose
+                                    original dynamic was deleted/invalid.
         """
         offset: Optional[str] = None
         page = 1
@@ -747,8 +803,13 @@ class BilibiliLotteryCleaner:
             print(f"🔍 模式: 试运行 (仅扫描，不删除)")
         else:
             print(f"⚡ 模式: 正式删除")
+        if include_invalid_repost:
+            print(f"🔗 失效转发: 一并处理")
         print(f"{'=' * 60}\n")
 
+        # ================================================================
+        # PHASE 1: Scan (NEVER delete here)
+        # ================================================================
         while True:
             print(f"\n📄 第 {page} 页 …")
             try:
@@ -779,49 +840,44 @@ class BilibiliLotteryCleaner:
 
                     # ── Check 2: Is it an invalid repost? ──
                     is_invalid_repost = False
-                    if not is_lottery:
+                    if not is_lottery and include_invalid_repost:
                         is_invalid_repost = is_repost_original_invalid(item)
+                    elif not is_lottery:
+                        # Repost detection only when opt-in
+                        is_invalid_repost_detected = is_repost_original_invalid(item)
+                        if is_invalid_repost_detected and self.debug:
+                            print(f"\n[{idx}] {dyn_id[:18]}")
+                            print(f"   🔗 检测到失效转发，但默认不处理（--include-invalid-repost 可启用）")
 
                     if not is_lottery and not is_invalid_repost:
                         if idx <= 3 or self.debug:
                             print(f"\n[{idx}] {dyn_id[:18]}  ⏭️  非目标动态")
                         continue
 
-                    # ── Build candidate info ──
+                    # ── Build shared candidate info ──
                     publish_time = extract_publish_time(item)
                     text_preview = extract_text_preview(item)
                     dynamic_url = DYNAMIC_URL_TEMPLATE.format(dyn_id=dyn_id)
 
+                    # ── Invalid repost path ──
                     if is_invalid_repost:
                         self.stats["invalid_repost"] += 1
                         print(f"\n[{idx}] {dyn_id[:18]}")
                         print(f"   🔗 转发动态 → 原动态已失效")
-                        detect_reason = "invalid_repost"
+                        candidates.append(CandidateInfo(
+                            dyn_id=dyn_id,
+                            orig_lottery_id=orig_id or str(item.get("orig", {}).get("id_str", "")),
+                            publish_time=publish_time,
+                            lottery_time=None,
+                            detect_reason="invalid_repost",
+                            text_preview=text_preview,
+                            dynamic_url=dynamic_url,
+                            is_repost_invalid=True,
+                            raw_item=item,  # always carry item for later deletion
+                        ))
+                        continue  # Don't check lottery status
 
-                        if not dry_run:
-                            candidates.append(CandidateInfo(
-                                dyn_id=dyn_id,
-                                orig_lottery_id=orig_id or str(item.get("orig", {}).get("id_str", "")),
-                                publish_time=publish_time,
-                                lottery_time=None,
-                                detect_reason=detect_reason,
-                                text_preview=text_preview,
-                                dynamic_url=dynamic_url,
-                                is_repost_invalid=True,
-                                raw_item=item if require_confirm else None,
-                            ))
-
-                            if not require_confirm:
-                                ok, _ = self.delete_dynamic(item)
-                                if ok:
-                                    self.stats["deleted"] += 1
-                                else:
-                                    self.stats["failed"] += 1
-                                self._random_delay(2.0, 4.0)
-
-                        continue  # Don't run lottery status check
-
-                    # ── Check 3: Lottery status ──
+                    # ── Lottery status path ──
                     self.stats["lottery"] += 1
                     state, lottery_time, state_reason = self.check_lottery_status(orig_id)
                     full_reason = f"{detect_method}+{state_reason}" if detect_method else state_reason
@@ -840,21 +896,6 @@ class BilibiliLotteryCleaner:
                         self.stats["expired"] += 1
                         time_str = _fmt_time_short(lottery_time)
                         print(f"   🎯 已开奖 ({time_str}, {state_reason})")
-
-                        if dry_run:
-                            print(f"   ⏸️  试运行，跳过")
-                            # Still record for display
-                            candidates.append(CandidateInfo(
-                                dyn_id=dyn_id,
-                                orig_lottery_id=orig_id,
-                                publish_time=publish_time,
-                                lottery_time=lottery_time,
-                                detect_reason=full_reason,
-                                text_preview=text_preview,
-                                dynamic_url=dynamic_url,
-                            ))
-                            continue
-
                         candidates.append(CandidateInfo(
                             dyn_id=dyn_id,
                             orig_lottery_id=orig_id,
@@ -863,16 +904,8 @@ class BilibiliLotteryCleaner:
                             detect_reason=full_reason,
                             text_preview=text_preview,
                             dynamic_url=dynamic_url,
-                            raw_item=item if require_confirm else None,
+                            raw_item=item,  # always carry item for later deletion
                         ))
-
-                        if not require_confirm:
-                            ok, _ = self.delete_dynamic(item)
-                            if ok:
-                                self.stats["deleted"] += 1
-                            else:
-                                self.stats["failed"] += 1
-                            self._random_delay(2.0, 4.0)
 
                 except Exception as e:
                     print(f"\n   ❌ 处理动态异常: {e}")
@@ -889,18 +922,33 @@ class BilibiliLotteryCleaner:
             else:
                 break
 
-        # ── Display candidates (dry-run or execute) ──
+        # ================================================================
+        # PHASE 2: Display (always, for both dry-run and execute)
+        # ================================================================
         if candidates:
             self._print_candidates_table(candidates)
-
             if export_candidates:
                 self._export_candidates_json(candidates)
 
-        # ── Confirmation (not dry_run, require_confirm, has candidates) ──
-        if not dry_run and require_confirm and candidates:
-            self._confirm_and_delete(candidates)
+        # ================================================================
+        # PHASE 3: Action (only when NOT dry_run AND candidates exist)
+        # ================================================================
+        if not dry_run and candidates:
+            if require_confirm:
+                # --execute (no --yes): input DELETE after table
+                self._confirm_and_delete(candidates)
+            else:
+                # --execute --yes: countdown AFTER table, then delete
+                print(f"\n⚠️  将在 3 秒后删除以上 {len(candidates)} 条动态 …")
+                for i in range(3, 0, -1):
+                    print(f"   {i}…")
+                    time.sleep(1)
+                print()
+                self._execute_deletion(candidates)
 
-        # ── Statistics ──
+        # ================================================================
+        # Statistics
+        # ================================================================
         print(f"\n{'=' * 60}")
         parts = [f"总{self.stats['total']}", f"抽奖{self.stats['lottery']}"]
         if self.stats["invalid_repost"]:
@@ -1016,6 +1064,19 @@ class BilibiliLotteryCleaner:
                 self.stats["failed"] += 1
             self._random_delay(2.0, 4.0)
 
+    def _execute_deletion(self, candidates: List[CandidateInfo]) -> None:
+        """Batch-delete candidates without confirmation (used by --execute --yes)."""
+        for c in candidates:
+            if c.raw_item is None:
+                print(f"   ⚠️  缺少原始动态数据，跳过: {c.dyn_id[:18]}")
+                self.stats["failed"] += 1
+                continue
+            if self.delete_dynamic(c.raw_item):
+                self.stats["deleted"] += 1
+            else:
+                self.stats["failed"] += 1
+            self._random_delay(2.0, 4.0)
+
 
 # ===================================================================
 # Cookie reading (unchanged core logic — kept as-is for stability)
@@ -1111,6 +1172,7 @@ def _try_chromium_browser(
         return False
 
     tmp_name = None
+    conn = None
     try:
         tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".db")
         tmp.close()
@@ -1140,7 +1202,6 @@ def _try_chromium_browser(
         conn = sqlite3.connect(tmp_name)
         conn.text_factory = bytes
         cur = conn.cursor()
-        # FIXED: use LIKE with wildcards to match all bilibili subdomains
         cur.execute(
             "SELECT host_key, name, encrypted_value FROM cookies "
             "WHERE host_key LIKE '%bilibili.com'"
@@ -1152,25 +1213,24 @@ def _try_chromium_browser(
                     cookies_dict[n] = decrypt_one(enc_val, master_key)
                 except Exception:
                     pass
-        conn.close()
 
         if "DedeUserID" in cookies_dict and "bili_jct" in cookies_dict:
             cookie_str = "; ".join(f"{k}={v}" for k, v in cookies_dict.items())
             print(f"✅ 已从 {browser_name} 读取到 {len(cookies_dict)} 个 bilibili cookie")
             print(f"   DedeUserID: {_sanitize_for_log(cookies_dict.get('DedeUserID', '???'))}")
             return cookie_str
-    except Exception as e:
-        if tmp_name:
-            try:
-                os.unlink(tmp_name)
-            except Exception:
-                pass
+    except Exception:
         return None
     finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
         if tmp_name:
             try:
                 os.unlink(tmp_name)
-            except Exception:
+            except OSError:
                 pass
 
     return None
@@ -1292,6 +1352,11 @@ def build_parser() -> argparse.ArgumentParser:
         description="Bilibili 抽奖动态清理工具 — 自动识别并删除已开奖互动抽奖动态",
     )
     p.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="显式试运行模式（默认即为试运行）。与 --execute 互斥，同时传入报错。",
+    )
+    p.add_argument(
         "--execute",
         action="store_true",
         help="执行删除模式。扫描后列出候选，需输入 DELETE 确认。",
@@ -1299,7 +1364,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--yes",
         action="store_true",
-        help="跳过二次确认（需与 --execute 搭配）。仍打印候选摘要并等待 3 秒倒计时。",
+        help="跳过二次确认（需与 --execute 搭配）。候选表打印后等待 3 秒倒计时再删除。",
     )
     p.add_argument(
         "--debug",
@@ -1321,6 +1386,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="导出候选列表为 JSON 文件（已脱敏，不含 Cookie/SESSDATA/bili_jct）。",
     )
+    p.add_argument(
+        "--include-invalid-repost",
+        action="store_true",
+        help="同时处理原动态已失效的转发动态（默认关闭，仅处理抽奖动态）。",
+    )
     return p
 
 
@@ -1329,12 +1399,21 @@ def main() -> None:
     args = parser.parse_args()
 
     # ── Mode resolution ──
-    # Default: dry-run (no --execute) → scan only
-    # --execute: scan + confirm + delete
-    # --execute --yes: scan + countdown + delete
+    # Default (no flags): dry-run (scan only)
+    # --dry-run: explicit dry-run (same as default)
+    # --execute: scan + display candidates + input DELETE → delete
+    # --execute --yes: scan + display candidates + 3s countdown → delete
     # --non-interactive: force dry-run, error if combined with --execute
 
+    # Conflict: --dry-run and --execute together
+    if args.dry_run and args.execute:
+        print("❌ --dry-run 与 --execute 互斥，不能同时使用")
+        sys.exit(1)
+
     dry_run = not args.execute
+    # --dry-run without --execute is fine (same as default)
+    if args.dry_run:
+        dry_run = True
 
     if args.non_interactive and args.execute:
         print("❌ --non-interactive 模式下不允许使用 --execute（禁止 CI 中删除）")
@@ -1358,9 +1437,12 @@ def main() -> None:
         print("🔍 试运行模式 (仅扫描，不删除)")
     else:
         if args.yes:
-            print("⚡ 正式删除模式 (跳过确认，3 秒倒计时)")
+            print("⚡ 正式删除模式 (候选表后 3 秒倒计时)")
         else:
-            print("⚡ 正式删除模式 (需输入 DELETE 确认)")
+            print("⚡ 正式删除模式 (候选表后需输入 DELETE 确认)")
+
+    if args.include_invalid_repost:
+        print("🔗 失效转发: 一并处理")
 
     # ── Read cookies (in-memory only) ──
     cookie = get_bilibili_cookies(allow_kill_browser=args.kill_browser)
@@ -1374,19 +1456,13 @@ def main() -> None:
         print(f"❌ {e}")
         sys.exit(1)
 
-    # ── Countdown for --execute --yes ──
-    if not dry_run and not require_confirm:
-        print(f"\n⚠️  将在 3 秒后开始删除（跳过二次确认）…")
-        for i in range(3, 0, -1):
-            print(f"   {i}…")
-            time.sleep(1)
-        print()
-
+    # ── Run (countdown is now inside process_dynamics, after candidate table) ──
     try:
         cleaner.process_dynamics(
             dry_run=dry_run,
             require_confirm=require_confirm,
             export_candidates=args.export_candidates,
+            include_invalid_repost=args.include_invalid_repost,
         )
     except KeyboardInterrupt:
         print("\n\n⚠️ 用户中断")

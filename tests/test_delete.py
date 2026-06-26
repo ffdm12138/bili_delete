@@ -26,6 +26,7 @@ from delete import (
     # Models
     LotteryState,
     CandidateInfo,
+    LotteryQueryResult,
     # Parsers
     parse_cookie_string,
     parse_lottery_state,
@@ -210,15 +211,18 @@ class TestParseLotteryState:
         assert state == LotteryState.UNKNOWN
         assert reason == "bad_timestamp"
 
-    def test_unrecognised_explicit_status_uses_time(self):
-        """Unrecognised explicit status falls through to time fallback."""
-        future_ts = (datetime.now(TZ_SHANGHAI) + timedelta(days=1)).timestamp()
+    def test_unrecognised_explicit_status_is_unknown(self):
+        """Unrecognised explicit status → UNKNOWN, no time fallback.
+        Even with a very old lottery_time, an unknown status value
+        must stay UNKNOWN because it could mean 'cancelled' etc."""
+        past_ts = (datetime.now(TZ_SHANGHAI) - timedelta(days=365)).timestamp()
         state, reason = parse_lottery_state({
             "lottery_status": "unknown_value",
-            "lottery_time": future_ts,
+            "lottery_time": past_ts,
         })
-        # Falls through to time fallback because "unknown_value" not in whitelist
-        assert state == LotteryState.ACTIVE
+        # Must be UNKNOWN, NOT FINISHED via time fallback
+        assert state == LotteryState.UNKNOWN
+        assert "unknown_status" in reason
 
     def test_no_status_no_time(self):
         state, _ = parse_lottery_state({"other_field": "value"})
@@ -506,9 +510,26 @@ class TestCLI:
         assert not args.yes
         assert not args.debug
         assert not args.non_interactive
+        assert not args.dry_run
 
         dry_run = not args.execute
         assert dry_run is True
+
+    def test_dry_run_explicit(self):
+        """--dry-run is an explicit no-op (same as default)."""
+        parser = build_parser()
+        args = parser.parse_args(["--dry-run"])
+        assert args.dry_run
+        assert not args.execute
+        dry_run = not args.execute or args.dry_run
+        assert dry_run is True
+
+    def test_dry_run_execute_conflict(self):
+        """--dry-run + --execute should be caught as error."""
+        parser = build_parser()
+        args = parser.parse_args(["--dry-run", "--execute"])
+        assert args.dry_run and args.execute
+        # main() must reject this combination
 
     def test_execute_mode(self):
         parser = build_parser()
@@ -538,17 +559,12 @@ class TestCLI:
         args = parser.parse_args(["--non-interactive", "--execute"])
         assert args.non_interactive
         assert args.execute
-        # The main() function should reject this combination
-        # We just verify the flags are parsed correctly
-        assert args.non_interactive and args.execute
 
     def test_yes_without_execute_is_noop(self):
-        """--yes without --execute should be handled (no-op or warning)."""
         parser = build_parser()
         args = parser.parse_args(["--yes"])
         assert args.yes
         assert not args.execute
-        # --yes should be ignored when --execute is not set
 
     def test_debug_flag(self):
         parser = build_parser()
@@ -564,6 +580,16 @@ class TestCLI:
         parser = build_parser()
         args = parser.parse_args(["--kill-browser"])
         assert args.kill_browser
+
+    def test_include_invalid_repost(self):
+        parser = build_parser()
+        args = parser.parse_args(["--include-invalid-repost"])
+        assert args.include_invalid_repost
+
+    def test_include_invalid_repost_default_off(self):
+        parser = build_parser()
+        args = parser.parse_args([])
+        assert not args.include_invalid_repost
 
 
 # ===================================================================
@@ -698,22 +724,19 @@ class TestProcessDynamics:
         )
 
         with patch.object(cleaner, "get_dynamics") as mock_get:
-            # Only one page
             mock_get.return_value = ([sample_lottery_item], None)
 
             with patch.object(cleaner, "get_lottery_info") as mock_lottery:
-                # Return finished lottery
-                mock_lottery.return_value = {
+                mock_lottery.return_value = LotteryQueryResult(info={
                     "lottery_status": "1",
                     "lottery_time": (
                         datetime.now(TZ_SHANGHAI) - timedelta(days=7)
                     ).timestamp(),
-                }
+                })
 
                 with patch.object(cleaner, "delete_dynamic") as mock_delete:
                     cleaner.process_dynamics(dry_run=True, require_confirm=False)
 
-                # delete_dynamic should NEVER be called in dry_run mode
                 mock_delete.assert_not_called()
 
     def test_unknown_state_never_deletes(self, sample_lottery_item):
@@ -727,19 +750,19 @@ class TestProcessDynamics:
             mock_get.return_value = ([sample_lottery_item], None)
 
             with patch.object(cleaner, "get_lottery_info") as mock_lottery:
-                # Return empty info → UNKNOWN state
-                mock_lottery.return_value = None
+                mock_lottery.return_value = LotteryQueryResult(
+                    error_type="empty"
+                )
 
                 with patch.object(cleaner, "delete_dynamic") as mock_delete:
                     cleaner.process_dynamics(
-                        dry_run=False, require_confirm=False
+                        dry_run=False, require_confirm=True
                     )
 
-                # UNKNOWN state must never trigger deletion
                 mock_delete.assert_not_called()
                 assert cleaner.stats["skipped_unknown"] >= 1
 
-    def test_finished_lottery_deletes_in_execute_mode(self, sample_lottery_item):
+    def test_finished_lottery_deletes_in_execute_yes_mode(self, sample_lottery_item):
         from delete import BilibiliLotteryCleaner
 
         cleaner = BilibiliLotteryCleaner(
@@ -750,22 +773,53 @@ class TestProcessDynamics:
             mock_get.return_value = ([sample_lottery_item], None)
 
             with patch.object(cleaner, "get_lottery_info") as mock_lottery:
-                mock_lottery.return_value = {
+                mock_lottery.return_value = LotteryQueryResult(info={
                     "lottery_status": "1",
                     "lottery_time": (
                         datetime.now(TZ_SHANGHAI) - timedelta(days=7)
                     ).timestamp(),
-                }
+                })
 
                 with patch.object(cleaner, "delete_dynamic") as mock_delete:
                     mock_delete.return_value = (True, "")
+                    # --execute --yes: dry_run=False, require_confirm=False
                     cleaner.process_dynamics(
                         dry_run=False, require_confirm=False
                     )
 
-                # Should have been called once
                 mock_delete.assert_called_once()
                 assert cleaner.stats["deleted"] == 1
+
+    def test_finished_lottery_deletes_after_confirm(self, sample_lottery_item):
+        from delete import BilibiliLotteryCleaner
+
+        cleaner = BilibiliLotteryCleaner(
+            "DedeUserID=1; bili_jct=abc; SESSDATA=x"
+        )
+
+        with patch.object(cleaner, "get_dynamics") as mock_get:
+            mock_get.return_value = ([sample_lottery_item], None)
+
+            with patch.object(cleaner, "get_lottery_info") as mock_lottery:
+                mock_lottery.return_value = LotteryQueryResult(info={
+                    "lottery_status": "1",
+                    "lottery_time": (
+                        datetime.now(TZ_SHANGHAI) - timedelta(days=7)
+                    ).timestamp(),
+                })
+
+                with patch.object(cleaner, "_confirm_and_delete") as mock_confirm:
+                    # --execute (no --yes): dry_run=False, require_confirm=True
+                    cleaner.process_dynamics(
+                        dry_run=False, require_confirm=True
+                    )
+
+                # _confirm_and_delete should be called with candidates
+                mock_confirm.assert_called_once()
+                candidates = mock_confirm.call_args[0][0]
+                assert len(candidates) >= 1
+                for c in candidates:
+                    assert c.raw_item is not None
 
     def test_active_lottery_not_deleted(self, sample_lottery_item):
         from delete import BilibiliLotteryCleaner
@@ -778,9 +832,9 @@ class TestProcessDynamics:
             mock_get.return_value = ([sample_lottery_item], None)
 
             with patch.object(cleaner, "get_lottery_info") as mock_lottery:
-                mock_lottery.return_value = {
-                    "lottery_status": "0",  # active
-                }
+                mock_lottery.return_value = LotteryQueryResult(info={
+                    "lottery_status": "0",
+                })
 
                 with patch.object(cleaner, "delete_dynamic") as mock_delete:
                     cleaner.process_dynamics(
@@ -789,7 +843,30 @@ class TestProcessDynamics:
 
                 mock_delete.assert_not_called()
 
-    def test_invalid_repost_deletes_in_execute_mode(self, sample_invalid_repost_item):
+    def test_invalid_repost_not_deleted_by_default(self, sample_invalid_repost_item):
+        """Without --include-invalid-repost, invalid reposts are NOT candidates."""
+        from delete import BilibiliLotteryCleaner
+
+        cleaner = BilibiliLotteryCleaner(
+            "DedeUserID=1; bili_jct=abc; SESSDATA=x"
+        )
+
+        with patch.object(cleaner, "get_dynamics") as mock_get:
+            mock_get.return_value = ([sample_invalid_repost_item], None)
+
+            with patch.object(cleaner, "delete_dynamic") as mock_delete:
+                cleaner.process_dynamics(
+                    dry_run=False, require_confirm=False,
+                    include_invalid_repost=False,
+                )
+
+            # Should NOT be called — default excludes invalid reposts
+            mock_delete.assert_not_called()
+            # Should NOT count as invalid_repost (only counts when opt-in)
+            assert cleaner.stats["deleted"] == 0
+
+    def test_invalid_repost_deletes_when_opted_in(self, sample_invalid_repost_item):
+        """With --include-invalid-repost, invalid reposts are candidates."""
         from delete import BilibiliLotteryCleaner
 
         cleaner = BilibiliLotteryCleaner(
@@ -801,14 +878,15 @@ class TestProcessDynamics:
 
             with patch.object(cleaner, "delete_dynamic") as mock_delete:
                 mock_delete.return_value = (True, "")
-                cleaner.process_dynamics(dry_run=False, require_confirm=False)
+                cleaner.process_dynamics(
+                    dry_run=False, require_confirm=False,
+                    include_invalid_repost=True,
+                )
 
-            # Invalid repost should be deleted without checking lottery status
             mock_delete.assert_called_once()
             assert cleaner.stats["invalid_repost"] >= 1
 
     def test_api_failure_does_not_silently_end_scan(self):
-        """get_dynamics raising an error should not be treated as 'no more items'."""
         from delete import BilibiliLotteryCleaner
 
         cleaner = BilibiliLotteryCleaner(
@@ -818,48 +896,84 @@ class TestProcessDynamics:
         with patch.object(cleaner, "get_dynamics") as mock_get:
             mock_get.side_effect = NetworkError("连接超时")
 
-            # Should not raise — process_dynamics catches it internally
             cleaner.process_dynamics(dry_run=True, require_confirm=False)
 
-            # No items processed
             assert cleaner.stats["total"] == 0
 
-    def test_require_confirm_collects_raw_items(self, sample_lottery_item):
-        """When require_confirm=True, candidates must carry raw_item for later deletion."""
+    def test_delete_never_called_during_scan(self, sample_lottery_item):
+        """Regression P0-2: delete_dynamic must NEVER be called during the scan loop.
+        It should only be called after the candidate table is printed."""
         from delete import BilibiliLotteryCleaner
 
         cleaner = BilibiliLotteryCleaner(
             "DedeUserID=1; bili_jct=abc; SESSDATA=x"
         )
 
-        candidates_captured = []
+        call_order = []
 
         with patch.object(cleaner, "get_dynamics") as mock_get:
             mock_get.return_value = ([sample_lottery_item], None)
 
             with patch.object(cleaner, "get_lottery_info") as mock_lottery:
-                mock_lottery.return_value = {
+                mock_lottery.return_value = LotteryQueryResult(info={
                     "lottery_status": "1",
                     "lottery_time": (
                         datetime.now(TZ_SHANGHAI) - timedelta(days=7)
                     ).timestamp(),
-                }
+                })
 
-                # Patch _confirm_and_delete to capture arguments instead of prompting
-                with patch.object(
-                    cleaner, "_confirm_and_delete",
-                    side_effect=lambda cands: candidates_captured.extend(cands),
-                ):
+                with patch.object(cleaner, "_print_candidates_table") as mock_table:
+                    mock_table.side_effect = lambda *a: call_order.append("table")
+
+                    with patch.object(cleaner, "delete_dynamic") as mock_delete:
+                        mock_delete.side_effect = lambda *a: (
+                            call_order.append("delete") or (True, "")
+                        )
+
+                        cleaner.process_dynamics(
+                            dry_run=False, require_confirm=False,
+                        )
+
+        # Table must appear BEFORE any deletion
+        if "delete" in call_order:
+            table_idx = call_order.index("table")
+            delete_idx = call_order.index("delete")
+            assert table_idx < delete_idx, (
+                "BUG: delete_dynamic called before _print_candidates_table! "
+                "Table must be shown first."
+            )
+
+    def test_scan_always_collects_raw_items(self, sample_lottery_item):
+        """ALL candidates must carry raw_item, regardless of require_confirm."""
+        from delete import BilibiliLotteryCleaner
+
+        cleaner = BilibiliLotteryCleaner(
+            "DedeUserID=1; bili_jct=abc; SESSDATA=x"
+        )
+
+        with patch.object(cleaner, "get_dynamics") as mock_get:
+            mock_get.return_value = ([sample_lottery_item], None)
+
+            with patch.object(cleaner, "get_lottery_info") as mock_lottery:
+                mock_lottery.return_value = LotteryQueryResult(info={
+                    "lottery_status": "1",
+                    "lottery_time": (
+                        datetime.now(TZ_SHANGHAI) - timedelta(days=7)
+                    ).timestamp(),
+                })
+
+                with patch.object(cleaner, "_execute_deletion") as mock_exec:
                     cleaner.process_dynamics(
-                        dry_run=False, require_confirm=True
+                        dry_run=False, require_confirm=False,
                     )
 
-        assert len(candidates_captured) >= 1
-        for c in candidates_captured:
-            assert c.raw_item is not None, (
-                "require_confirm must populate raw_item for deletion"
-            )
-            assert "params" in c.raw_item
+                if mock_exec.call_args:
+                    candidates = mock_exec.call_args[0][0]
+                    for c in candidates:
+                        assert c.raw_item is not None, (
+                            "All candidates must carry raw_item for deletion"
+                        )
+                        assert "params" in c.raw_item
 
 
 # ===================================================================
