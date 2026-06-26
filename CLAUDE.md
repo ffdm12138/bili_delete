@@ -10,7 +10,7 @@
 - **requests** — HTTP 请求，带 retry/backoff
 - **pycryptodome + pywin32** — AES-GCM 解密 Chromium 系浏览器 cookie
 - **browser-cookie3** — 备用读取 Firefox cookie
-- **pytest** — 85 个单元/集成测试
+- **pytest** — 132 个单元/集成测试
 
 ## 项目结构
 
@@ -19,7 +19,7 @@ bili_delete/
 ├── delete.py            # 主脚本（~1,600 行）
 ├── tests/
 │   ├── __init__.py
-│   └── test_delete.py   # 85 个测试用例
+│   └── test_delete.py   # 132 个测试用例
 ├── README.md            # 用户文档
 ├── CLAUDE.md            # 本文件（技术文档）
 ├── requirements.txt     # Python 依赖

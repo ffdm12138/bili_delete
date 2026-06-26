@@ -1720,3 +1720,38 @@ class TestCookieSuccessPath:
         result = _decrypt_chromium_cookies(db_path, ls_path)
 
         assert result is None
+
+    def test_try_chromium_browser_success_path(self, tmp_path):
+        """Regression: _try_chromium_browser must return cookie_str, not None.
+        This prevents the 'finally return None overwrites success' bug."""
+        import shutil
+        import tempfile
+        from delete import _try_chromium_browser
+
+        # Create fake cookie DB and local state files
+        cookie_db = tmp_path / "Cookies"
+        local_state = tmp_path / "Local State"
+        cookie_db.write_bytes(b"fake sqlite db")
+        local_state.write_text(
+            '{"os_crypt":{"encrypted_key":"RFBBUE' + ("A" * 198) + '"}}',
+            encoding="utf-8",
+        )
+
+        with patch("delete._decrypt_chromium_cookies") as mock_decrypt:
+            mock_decrypt.return_value = "DedeUserID=12345; bili_jct=abc; SESSDATA=xyz"
+            with patch("os.path.isfile", return_value=True):
+                with patch.object(shutil, "copy2"):
+                    result = _try_chromium_browser(
+                        [str(cookie_db)],
+                        [str(local_state)],
+                        "Chrome",
+                        prefix_32=False,
+                        allow_kill_browser=False,
+                    )
+
+        assert result is not None, (
+            "BUG: _try_chromium_browser returned None on success path — "
+            "check for finally: return None regression"
+        )
+        assert "DedeUserID=12345" in result
+        assert "bili_jct=abc" in result

@@ -807,14 +807,15 @@ class BilibiliLotteryCleaner:
 
         self._log_debug(f"DELETE response: {json.dumps(result, ensure_ascii=False)}")
 
-        if result.get("code") == 0:
+        code = _safe_int_code(result.get("code"))
+        if code == 0:
             print(f"   ✅ 已删除: {dyn_id_str[:18]}")
             return True, ""
         else:
-            code = result.get("code", "?")
+            raw_code = result.get("code", "?")
             msg = str(result.get("message", "未知错误"))
-            print(f"   ❌ 删除失败: {msg} (code={code})")
-            return False, f"code={code}: {msg}"
+            print(f"   ❌ 删除失败: {msg} (code={raw_code})")
+            return False, f"code={raw_code}: {msg}"
 
     # ------------------------------------------------------------------
     # Main process
@@ -1169,7 +1170,7 @@ class BilibiliLotteryCleaner:
 
 
 # ===================================================================
-# Cookie reading (unchanged core logic — kept as-is for stability)
+# Cookie reading
 # ===================================================================
 
 
@@ -1331,7 +1332,6 @@ def _try_chromium_browser(
         return False
 
     tmp_name = None
-    conn = None
     try:
         tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".db")
         tmp.close()
@@ -1352,11 +1352,6 @@ def _try_chromium_browser(
     except Exception:
         return None
     finally:
-        if conn is not None:
-            try:
-                conn.close()
-            except Exception:
-                pass
         if tmp_name:
             try:
                 os.unlink(tmp_name)
